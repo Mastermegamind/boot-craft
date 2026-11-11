@@ -70,6 +70,10 @@ pub fn open_exclusive(drive: &Drive) -> Result<Opened, Error> {
     Ok(Opened { file, sector: 1, hold: None })
 }
 
+pub fn sync(file: &File) -> io::Result<()> {
+    file.sync_all()
+}
+
 pub fn drop_cache(file: &File) {
     let fd = file.as_raw_fd();
     // SAFETY: `fd` stays open for both calls, which take only integers. If

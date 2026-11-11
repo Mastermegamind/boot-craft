@@ -15,6 +15,8 @@ use crate::error::Error;
 
 /// `_IOR('d', 24, uint32_t)`: the disk's block size.
 const DKIOCGETBLOCKSIZE: libc::c_ulong = 0x4004_6418;
+/// `_IO('d', 22)`: flush the drive's own write cache.
+const DKIOCSYNCHRONIZECACHE: libc::c_ulong = 0x2000_6416;
 
 fn diskutil(args: &[&str]) -> io::Result<Value> {
     let output = Command::new("/usr/sbin/diskutil").args(args).output()?;
@@ -74,6 +76,23 @@ pub fn open_exclusive(drive: &Drive) -> Result<Opened, Error> {
     let result = unsafe { libc::ioctl(file.as_raw_fd(), DKIOCGETBLOCKSIZE, &mut block as *mut u32) };
     let sector = if result == 0 && block > 0 { block as usize } else { 512 };
     Ok(Opened { file, sector, hold: None })
+}
+
+/// `File::sync_all` uses `F_FULLFSYNC`, which raw disks refuse ("Inappropriate
+/// ioctl for device"): `fsync`, then have the drive flush its own cache.
+pub fn sync(file: &File) -> io::Result<()> {
+    let fd = file.as_raw_fd();
+    // SAFETY: `fd` is open for both calls, which take only integers.
+    if unsafe { libc::fsync(fd) } != 0 {
+        let e = io::Error::last_os_error();
+        if e.raw_os_error() != Some(libc::ENOTTY) {
+            return Err(e);
+        }
+    }
+    // SAFETY: as above; the ioctl takes no argument. Drives that don't
+    // support it have no cache to flush.
+    unsafe { libc::ioctl(fd, DKIOCSYNCHRONIZECACHE) };
+    Ok(())
 }
 
 /// `/dev/rdiskN` isn't cached, so there's nothing to drop.

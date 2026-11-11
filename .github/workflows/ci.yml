@@ -86,3 +86,16 @@ jobs:
       - run: cargo build --locked
       - run: sudo scripts/macos-test.sh
 
+  # Real writes on Windows, to a VHD attached as a disk: no real drive is touched.
+  windows-disk:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.85"
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked
+      - run: ./scripts/windows-test.ps1
+        shell: pwsh
+

@@ -83,7 +83,7 @@ impl RawDrive {
     /// Pushes everything written onto the drive itself and drops cached
     /// copies, so that a read-back comes from the drive.
     pub fn flush_to_drive(&mut self) -> io::Result<()> {
-        self.file.sync_all()?;
+        imp::sync(&self.file)?;
         imp::drop_cache(&self.file);
         Ok(())
     }
