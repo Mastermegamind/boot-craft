@@ -6,8 +6,8 @@ what [Rufus](https://rufus.ie) does on Windows, sharing none of its code.
 
 > **Status: early.** Raw writing with verification works on Linux, macOS
 > and Windows, for plain and compressed images, and Windows 10/11 install
-> drives (UEFI, FAT32) can be made from Windows ISOs. NTFS and BIOS boot
-> for Windows, and the other image types, come next. See
+> drives (FAT32, for UEFI and BIOS PCs) can be made from Windows ISOs. NTFS
+> mode for Windows, and the other image types, come next. See
 > [PLAN.md](PLAN.md) for the roadmap and [GOAL.md](GOAL.md) for what we're
 > building and why.
 
@@ -22,7 +22,7 @@ written. `boot-craft info` says what it found and why.
 | Linux hybrid ISOs | Ubuntu, Fedora, Debian, Mint, Arch, Kali, Parrot, Tails | raw write + verify | done |
 | BSD, ChromeOS Flex, ARM boards | FreeBSD memstick, ChromeOS Flex `.bin`, Raspberry Pi OS `.img` | raw write + verify | done |
 | Compressed images | `.xz`, `.gz`, `.zst`, `.bz2`, `.zip`, fixed `.vhd` | decompressed while writing | done |
-| Windows install ISOs | Windows 10 / 11, Server | FAT32 file copy for UEFI, `install.wim` split if over 4 GiB, Windows 11 setup options | done (UEFI); NTFS and BIOS boot planned (M3) |
+| Windows install ISOs | Windows 10 / 11, Server | FAT32 file copy for UEFI and BIOS, `install.wim` split if over 4 GiB, Windows 11 setup options | done; NTFS mode planned (M3) |
 | Windows PE ISOs | Hiren's BootCD PE | FAT32 file copy for UEFI | done |
 | Non-hybrid Linux / rescue ISOs | older distros | file copy + GRUB / Syslinux | planned (M4) |
 | macOS | recovery (`BaseSystem.dmg`) from any OS; full installer on a Mac | HFS+ / `createinstallmedia` | planned (M4) |
@@ -35,8 +35,8 @@ written. `boot-craft info` says what it found and why.
 | List safe drives | done | done | done |
 | Raw write + verify | done | done | done |
 | Recognise every image type | done | done | done |
-| Windows install USB (UEFI) + Windows 11 options | done | done | done |
-| Windows: NTFS mode, BIOS boot | planned (M3) | planned (M3) | planned (M3) |
+| Windows install USB (UEFI, BIOS) + Windows 11 options | done | done | done |
+| Windows: NTFS mode | planned (M3) | planned (M3) | planned (M3) |
 | Other ISOs, macOS media, FreeDOS | planned (M4) | planned (M4) | planned (M4) |
 | GUI | planned (M5) | planned (M5) | planned (M5) |
 
@@ -52,6 +52,7 @@ sudo boot-craft write ubuntu.iso sdb --sha256 <expected>   # check the image fir
 sudo boot-craft write raspios.img.xz sdb --unmount          # compressed; unmount sdb's volumes first
 boot-craft list --watch                                     # follow drives as they come and go
 sudo boot-craft write Win11_24H2.iso sdb                    # a Windows install drive (UEFI)
+sudo boot-craft write Win10_22H2.iso sdb --scheme mbr       # one that BIOS PCs start too
 sudo boot-craft write Win11_24H2.iso sdb --bypass-requirements --local-account ada --skip-privacy
 ```
 
@@ -69,9 +70,9 @@ what state the drive is in.
 ### Windows install drives
 
 A Windows ISO isn't written raw: its file system only works on DVDs.
-`write` makes the drive the way Microsoft's own tool does for UEFI PCs:
-a GPT partition table (`--scheme mbr` for older firmware), one FAT32
-partition, and the ISO's files, each read back and compared afterwards.
+`write` makes the drive the way Microsoft's own tool does: a GPT partition
+table (`--scheme mbr` for older PCs, see below), one FAT32 partition, and the
+ISO's files, each read back and compared afterwards.
 `boot-craft info` shows the release and editions it found in `install.wim`.
 
 FAT32 can't hold files of 4 GiB or more, and current `install.wim`s are
@@ -93,9 +94,17 @@ reads by itself. Each one only adds its own settings:
 | `--locale en-US` | sets the language and region |
 | `--no-bitlocker` | doesn't turn on BitLocker device encryption by itself |
 
-These drives boot in UEFI mode, which every PC sold for Windows 8 or later
-has. Booting them from a legacy BIOS, and ISOs with a single file over
-4 GiB besides `install.wim` (which need NTFS), are not done yet.
+Which PCs start the drive:
+
+- **GPT** (the default): UEFI PCs, which is every PC sold for Windows 8 or
+  later. A BIOS that tries it is told the drive is for UEFI.
+- **MBR** (`--scheme mbr`): UEFI PCs, and also legacy BIOS PCs (and UEFI
+  ones in CSM / legacy mode). boot-craft writes its own MBR and FAT32 boot
+  code (`crates/bc-core/boot/`, a few hundred bytes of assembly) that loads
+  Windows' `bootmgr`. ISOs without `bootmgr` (ARM64 ones) are UEFI only.
+
+ISOs with a single file over 4 GiB besides `install.wim` need NTFS, which
+isn't done yet; they're refused before anything is erased.
 
 ## AI agents (MCP)
 
@@ -147,7 +156,7 @@ End-to-end tests on loop devices (Linux, need root, touch no real drive):
 cargo build
 sudo scripts/loop-test.sh          # raw writes, compressed images, MCP
 sudo scripts/boot-test.sh          # the Alpine ISO, booted in QEMU (BIOS and UEFI)
-sudo scripts/windows-usb-test.sh   # Windows drives: fsck.fat, mount, UEFI boot in QEMU
+sudo scripts/windows-usb-test.sh   # Windows drives: fsck.fat, mount, UEFI and BIOS boot in QEMU
 sudo BIG=1 scripts/windows-usb-test.sh   # also a 4 GiB+ install.wim, split
 ```
 

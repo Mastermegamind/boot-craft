@@ -199,12 +199,19 @@ Rules:
       `scripts/windows-usb-test.sh` on loop devices: GPT and MBR, `fsck.fat`,
       mounted by Linux, booted by OVMF in QEMU to its EFI loader, and (BIG=1)
       a 4.1 GiB install.wim split and verified by wimlib
+- [x] Legacy BIOS boot (`boot/mbr.asm`, `boot/fat32.asm`): our own MBR code
+      (starts the active partition; on GPT's protective MBR, says the drive
+      is UEFI only) and FAT32 boot code in sector 0 and reserved sector 2 that
+      follows `bootmgr`'s cluster chain, loads it to 2000:0000 and starts it
+      as GRUB's `ntldr` does. Any sector size; LBA reads. The assembled bytes
+      are committed and a test checks them against the source. Tested by
+      SeaBIOS in QEMU booting MBR sticks (128 MB and 40 GB) to a stand-in
+      `bootmgr` that checks every sector of itself arrived; not yet with
+      Microsoft's real `bootmgr`
 - [ ] **NTFS mode**: NTFS data partition plus a small FAT partition with a
       UEFI:NTFS-style loader; NTFS formatting via the OS on Windows, bundled
       `mkntfs` on Linux and macOS. Needed for ISOs with another file over
       4 GiB, or an install.wim with one file inside over 4 GiB
-- [ ] Legacy BIOS boot: MBR boot code and a FAT32 boot sector that loads
-      `bootmgr`. Until then the boot sector says to start in UEFI mode
 - [ ] Pick FAT32 or NTFS mode automatically and say why (FAT32 only so far;
       what it can't hold is refused before anything is erased)
 - [ ] A real Windows ISO through the weekly real-image job (Microsoft's

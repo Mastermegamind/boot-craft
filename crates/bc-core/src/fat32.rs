@@ -399,17 +399,18 @@ fn directory(layout: &Layout, dir: Option<usize>) -> Vec<u8> {
 pub fn write_tables<D: Read + Write + Seek>(cache: &mut Cache<D>, start: u64, layout: &Layout) -> io::Result<()> {
     let sector = u64::from(layout.sector);
 
-    // The reserved area: boot sector, FSInfo, their backups at 6 and 7.
+    // The reserved area: boot sector, FSInfo and the rest of the boot code
+    // (sector 2), their backups at 6, 7 and 8.
     let mut reserved = vec![0u8; (u64::from(layout.reserved) * sector) as usize];
     let boot = boot_sector(layout);
     let info = fs_info(layout);
     let s = sector as usize;
     reserved[..s].copy_from_slice(&boot);
     reserved[s..2 * s].copy_from_slice(&info);
-    reserved[2 * s + 508..2 * s + 512].copy_from_slice(&0xAA55_0000u32.to_le_bytes());
+    reserved[2 * s..2 * s + 512].copy_from_slice(&BOOT_CODE[512..]);
     reserved[6 * s..7 * s].copy_from_slice(&boot);
     reserved[7 * s..8 * s].copy_from_slice(&info);
-    reserved[8 * s + 508..8 * s + 512].copy_from_slice(&0xAA55_0000u32.to_le_bytes());
+    reserved[8 * s..8 * s + 512].copy_from_slice(&BOOT_CODE[512..]);
 
     // The FAT, built a piece at a time (it's megabytes on big sticks).
     let fat_bytes = u64::from(layout.fat_sectors) * sector;
@@ -465,6 +466,10 @@ pub fn write_tables<D: Read + Write + Seek>(cache: &mut Cache<D>, start: u64, la
     cache.write_at(start, &reserved[..s])
 }
 
+/// BIOS boot code that finds and starts BOOTMGR (`boot/fat32.asm`): sector 0
+/// around the BPB, then the 512 bytes of reserved sector 2.
+const BOOT_CODE: &[u8; 1024] = include_bytes!("../boot/fat32.bin");
+
 fn boot_sector(l: &Layout) -> Vec<u8> {
     let mut b = vec![0u8; l.sector as usize];
     b[0..3].copy_from_slice(&[0xEB, 0x58, 0x90]);
@@ -488,31 +493,8 @@ fn boot_sector(l: &Layout) -> Vec<u8> {
     b[67..71].copy_from_slice(&l.volume_id.to_le_bytes());
     b[71..82].copy_from_slice(&l.label);
     b[82..90].copy_from_slice(b"FAT32   ");
-    // Booted by a BIOS anyway: say so and wait, instead of running junk.
-    let message = b"Not a BIOS boot drive: start it in UEFI mode.\r\n\0";
-    #[rustfmt::skip]
-    let code: [u8; 31] = [
-        0xFA, 0xFC,             // cli; cld
-        0x31, 0xC0,             // xor ax, ax
-        0x8E, 0xD8, 0x8E, 0xD0, // mov ds, ax; mov ss, ax
-        0xBC, 0x00, 0x7C,       // mov sp, 0x7c00
-        0xFB,                   // sti
-        0x31, 0xDB,             // xor bx, bx (video page 0)
-        0xBE, 0x00, 0x00,       // mov si, message (filled in below)
-        0xAC,                   // next: lodsb
-        0x08, 0xC0,             // or al, al
-        0x74, 0x06,             // jz halt
-        0xB4, 0x0E,             // mov ah, 0x0e
-        0xCD, 0x10,             // int 0x10
-        0xEB, 0xF5,             // jmp next
-        0xF4,                   // halt: hlt
-        0xEB, 0xFD,             // jmp halt
-    ];
-    let code_at = 90;
-    let message_at = code_at + code.len();
-    b[code_at..message_at].copy_from_slice(&code);
-    b[code_at + 15..code_at + 17].copy_from_slice(&(0x7C00u16 + message_at as u16).to_le_bytes());
-    b[message_at..message_at + message.len()].copy_from_slice(message);
+    // The BIOS boot code that loads BOOTMGR, around the BPB.
+    b[90..510].copy_from_slice(&BOOT_CODE[90..510]);
     b[510] = 0x55;
     b[511] = 0xAA;
     let n = b.len();
@@ -666,6 +648,36 @@ mod tests {
             let text = String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
             assert!(out.status.success(), "{size} bytes, {sector}-byte sectors:\n{text}");
             assert!(!text.contains("Free cluster summary"), "{text}");
+        }
+    }
+
+    #[test]
+    fn the_bios_boot_code_is_in_place() {
+        let image = volume(64 << 20, 512, sample(), bytes);
+        assert_eq!(image[90..510], BOOT_CODE[90..510]);
+        assert_eq!(image[2 * 512..3 * 512], BOOT_CODE[512..], "the rest of it in sector 2");
+        assert_eq!(image[8 * 512..9 * 512], BOOT_CODE[512..], "and its backup in 8");
+        assert_eq!(image[510..512], [0x55, 0xAA]);
+    }
+
+    /// The committed boot code is what its source builds to (when nasm is
+    /// installed: `boot/build.sh` rebuilds it).
+    #[test]
+    fn the_boot_code_matches_its_source() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("boot");
+        let out = std::env::temp_dir().join(format!("bc-bootcode-{}", std::process::id()));
+        for name in ["mbr", "fat32"] {
+            let built = out.with_extension(name);
+            let status =
+                std::process::Command::new("nasm").arg("-f").arg("bin").arg("-o").arg(&built).arg(dir.join(format!("{name}.asm"))).status();
+            let Ok(status) = status else {
+                eprintln!("nasm isn't installed: not checked");
+                return;
+            };
+            assert!(status.success(), "nasm failed on {name}.asm");
+            let fresh = std::fs::read(&built).unwrap();
+            let _ = std::fs::remove_file(&built);
+            assert_eq!(fresh, std::fs::read(dir.join(format!("{name}.bin"))).unwrap(), "{name}.bin is stale: run boot/build.sh");
         }
     }
 

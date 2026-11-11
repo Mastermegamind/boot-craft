@@ -188,7 +188,8 @@ struct JobState {
 /// A write running (or finished) in the background.
 struct Job {
     drive: String,
-    windows: bool,
+    /// For a Windows stick: which PCs it starts.
+    windows: Option<&'static str>,
     image: PathBuf,
     total: u64,
     started: Instant,
@@ -415,7 +416,7 @@ impl<D: Drives> Server<D> {
                 "Prepare to write an image",
                 "Checks that `image` can be written to `drive` (it can be made bootable, its SHA-256 matches if given, the \
                  drive may be erased and is big enough) without changing anything. Hybrid ISOs and disk images are written \
-                 raw; Windows ISOs become a FAT32 install drive for UEFI, optionally with Windows 11 setup options. Returns what will be erased and a one-time \
+                 raw; Windows ISOs become a FAT32 install drive for UEFI (scheme mbr: BIOS too), optionally with Windows 11 setup options. Returns what will be erased and a one-time \
                  token for confirm_write. Show the summary to the person before confirming.",
                 json!({
                     "type": "object",
@@ -425,7 +426,7 @@ impl<D: Drives> Server<D> {
                         "sha256": { "type": "string", "description": "Expected SHA-256 of the image (64 hex digits)" },
                         "force": { "type": "boolean", "description": "Allow an image that won't boot when written raw" },
                         "unmount": { "type": "boolean", "description": "Unmount the drive's volumes first instead of refusing (never the system's)" },
-                        "scheme": { "type": "string", "enum": ["gpt", "mbr"], "description": "Windows images: partition table (default gpt)" },
+                        "scheme": { "type": "string", "enum": ["gpt", "mbr"], "description": "Windows images: partition table: gpt (default, UEFI only) or mbr (UEFI and BIOS PCs)" },
                         "bypass_requirements": { "type": "boolean", "description": "Windows 11: install without TPM 2.0, Secure Boot or 4 GB of RAM" },
                         "local_account": { "type": "string", "description": "Windows: create this local account instead of requiring a Microsoft account" },
                         "skip_privacy": { "type": "boolean", "description": "Windows: answer the privacy questions with no" },
@@ -677,6 +678,8 @@ impl<D: Drives> Server<D> {
                 "files": p.files,
                 "bytes": p.bytes,
                 "splits_install_wim": p.split.is_some(),
+                "starts_on": p.starts_on(),
+                "bios_boot": p.bios(),
                 "setup_options": p.unattend_options,
             })),
         });
@@ -776,7 +779,7 @@ impl<D: Drives> Server<D> {
             job_id.clone(),
             Job {
                 drive: pending.drive.name.clone(),
-                windows: pending.plan.is_some(),
+                windows: pending.plan.as_ref().map(|p| p.starts_on()),
                 image: image.clone(),
                 total: pending.len,
                 started: Instant::now(),
@@ -846,15 +849,16 @@ impl<D: Drives> Server<D> {
                     size(rate)
                 )
             }
-            Some(Ok(result)) if job.windows => {
+            Some(Ok(result)) if job.windows.is_some() => {
                 data["status"] = json!("done");
                 data["result"] = result.clone();
                 format!(
                     "Done: {} is a Windows install drive made from {}: {} files, each read back and verified. It can be \
-                     removed; boot from it in UEFI mode.",
+                     removed; it starts on {}.",
                     job.drive,
                     job.image.display(),
-                    result["files"]
+                    result["files"],
+                    job.windows.unwrap_or_default()
                 )
             }
             Some(Ok(result)) => {

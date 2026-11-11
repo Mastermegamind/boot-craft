@@ -1,7 +1,8 @@
 //! Windows install sticks from a Windows ISO, the way Windows' own Media
-//! Creation Tool and Rufus make them for UEFI: one FAT32 partition (on GPT
-//! or MBR) holding the ISO's files. UEFI firmware boots
-//! `efi/boot/bootx64.efi` from it, and Windows Setup reads `sources/`.
+//! Creation Tool and Rufus make them: one FAT32 partition (on GPT or MBR)
+//! holding the ISO's files. UEFI firmware boots `efi/boot/bootx64.efi` from
+//! it, and Windows Setup reads `sources/`. On MBR, a BIOS boots it too:
+//! boot-craft's MBR and FAT32 boot code (`boot/`) start `bootmgr`.
 //!
 //! FAT32 can't hold a file of 4 GiB or more, and current `install.wim`s are
 //! bigger. Such a WIM is split into `install.swm` parts with wimlib (Setup
@@ -42,8 +43,8 @@ const MAX_ENTRIES: usize = 100_000;
 /// How to make the stick.
 #[derive(Debug, Clone)]
 pub struct Options {
-    /// GPT (UEFI, the default for Windows 11) or MBR (UEFI too; also what
-    /// older firmware with buggy GPT support wants).
+    /// GPT (UEFI only, the default for Windows 11) or MBR (UEFI, and BIOS
+    /// PCs when the image has `bootmgr`).
     pub scheme: Scheme,
     /// Windows Setup options, written as `autounattend.xml`.
     pub unattend: unattend::Options,
@@ -92,6 +93,8 @@ pub struct Plan {
     /// The `autounattend.xml` to add, if any options were chosen.
     pub unattend: Option<String>,
     pub unattend_options: Vec<String>,
+    /// The image has `bootmgr`, Windows' BIOS boot manager.
+    bootmgr: bool,
     split_part_mib: u32,
     temp_dir: Option<PathBuf>,
 }
@@ -116,7 +119,24 @@ impl Plan {
         if let Some(split) = &self.split {
             text.push_str(&format!("; {} ({} bytes) is split into .swm parts for FAT32", split.path, split.size));
         }
+        text.push_str("; starts on ");
+        text.push_str(self.starts_on());
         text
+    }
+
+    /// Whether a BIOS (not just UEFI) can start the stick: it needs MBR and
+    /// an image with `bootmgr`.
+    pub fn bios(&self) -> bool {
+        self.scheme == Scheme::Mbr && self.bootmgr
+    }
+
+    /// Which PCs the stick starts, and if only UEFI ones, why.
+    pub fn starts_on(&self) -> &'static str {
+        match (self.scheme, self.bootmgr) {
+            (Scheme::Mbr, true) => "UEFI and BIOS PCs",
+            (Scheme::Gpt, true) => "UEFI PCs (with --scheme mbr, BIOS PCs too)",
+            (_, false) => "UEFI PCs (the image has no bootmgr for BIOS PCs)",
+        }
     }
 }
 
@@ -169,6 +189,7 @@ pub fn plan(source: &Source, detected: &Detected, options: &Options) -> Result<P
     let bytes =
         entries.iter().map(|(_, e)| if e.is_dir { 0 } else { e.size }).sum::<u64>() + unattend_xml.as_ref().map_or(0, |x| x.len() as u64);
     let label = header_label(source).map(|l| fat_label(&l)).unwrap_or_else(|| "WINDOWS".into());
+    let bootmgr = entries.iter().any(|(path, e)| !e.is_dir && e.size > 0 && path.eq_ignore_ascii_case("bootmgr"));
     Ok(Plan {
         scheme: options.scheme,
         label,
@@ -178,6 +199,7 @@ pub fn plan(source: &Source, detected: &Detected, options: &Options) -> Result<P
         split,
         unattend_options: options.unattend.describe(),
         unattend: unattend_xml,
+        bootmgr,
         split_part_mib: options.split_part_mib,
         temp_dir: options.temp_dir.clone(),
     })

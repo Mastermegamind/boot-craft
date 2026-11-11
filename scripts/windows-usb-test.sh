@@ -3,13 +3,15 @@
 # Windows-shaped ISO (UDF, as Microsoft's are) whose EFI boot loader is a
 # small GRUB that prints a marker, makes a drive from it with boot-craft
 # (GPT and MBR), checks the result with fsck.fat and by mounting it, then
-# boots it in QEMU with UEFI firmware until the marker appears.
+# boots it in QEMU with UEFI firmware until the marker appears. The MBR drive
+# is also booted from a BIOS (SeaBIOS), through boot-craft's boot code to a
+# stand-in BOOTMGR (fake-bootmgr.asm) that checks how it was loaded.
 #
 # With BIG=1 it also does what current Windows ISOs need: an install.wim
 # over 4 GiB, which has to be split into .swm parts for FAT32. That needs
 # about 13 GiB of free disk space and a few minutes.
 #
-# Needs root (losetup, mount), genisoimage, wimlib-imagex, grub-mkstandalone
+# Needs root (losetup, mount), nasm, python3, genisoimage, wimlib-imagex, grub-mkstandalone
 # (with the x86_64-efi modules), fsck.fat, qemu-system-x86_64 and OVMF.
 #
 #   cargo build && sudo scripts/windows-usb-test.sh
@@ -19,7 +21,7 @@ cd "$(dirname "$0")/.."
 BIN=$(realpath "${BIN:-target/debug/boot-craft}")
 [ -x "$BIN" ] || { echo "build first: cargo build" >&2; exit 1; }
 [ "$(id -u)" = 0 ] || { echo "needs root: sudo $0" >&2; exit 1; }
-for tool in genisoimage wimlib-imagex grub-mkstandalone fsck.fat qemu-system-x86_64; do
+for tool in nasm python3 genisoimage wimlib-imagex grub-mkstandalone fsck.fat qemu-system-x86_64; do
     command -v "$tool" >/dev/null || { echo "needs $tool" >&2; exit 1; }
 done
 OVMF=$(ls /usr/share/ovmf/OVMF.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/qemu/OVMF.fd 2>/dev/null | head -1 || true)
@@ -39,13 +41,26 @@ pass() { echo "PASS: $*"; }
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
 MARKER=BOOT-CRAFT-UEFI-OK
-# make_iso <name> <install.wim payload size in MiB>
+BIOS_MARKER=BOOT-CRAFT-BIOS-OK
+# A stand-in BOOTMGR about the size of Windows 11's (450 KiB).
+make_bootmgr() {
+    local sectors=900
+    nasm -f bin -DSECTORS=$sectors -o "$1" scripts/fake-bootmgr.asm
+    python3 - "$1" $sectors <<'PY'
+import os, struct, sys
+path, sectors = sys.argv[1], int(sys.argv[2])
+with open(path, "ab") as f:
+    for n in range(1, sectors):
+        f.write(struct.pack("<I", n) + os.urandom(504) + struct.pack("<I", n ^ 0xFFFFFFFF))
+PY
+}
+# make_iso <name> <install.wim payload size in MiB> [no-bootmgr]
 make_iso() {
     local name=$1 mib=$2 tree="$work/$1"
     mkdir -p "$tree/efi/boot" "$tree/efi/microsoft/boot" "$tree/boot" "$tree/sources" "$work/$1-payload"
     printf 'echo "%s"\nsleep 2\nhalt\n' "$MARKER" >"$work/grub.cfg"
     grub-mkstandalone -O x86_64-efi -o "$tree/efi/boot/bootx64.efi" --modules="echo sleep halt" "boot/grub/grub.cfg=$work/grub.cfg"
-    : >"$tree/bootmgr"
+    [ "${3:-}" = no-bootmgr ] || make_bootmgr "$tree/bootmgr"
     : >"$tree/bootmgr.efi"
     : >"$tree/setup.exe"
     : >"$tree/boot/etfsboot.com"
@@ -85,6 +100,26 @@ boot_uefi() {
     kill "$qemu" 2>/dev/null || true
     tail -c 2000 "$log" | tr -d '\r' >&2
     fail "$what didn't boot from UEFI"
+}
+
+# boot_bios <stick> <what> <text to wait for>
+boot_bios() {
+    local stick=$1 what=$2 want=$3 log="$work/boot.log"
+    timeout 60 qemu-system-x86_64 -m 256 -nographic -snapshot -nic none \
+        -drive "file=$stick,format=raw,if=ide" >"$log" 2>&1 &
+    local qemu=$!
+    for _ in $(seq 60); do
+        if grep -aq "$want" "$log"; then
+            kill "$qemu" 2>/dev/null || true
+            wait "$qemu" 2>/dev/null || true
+            return
+        fi
+        kill -0 "$qemu" 2>/dev/null || break
+        sleep 1
+    done
+    kill "$qemu" 2>/dev/null || true
+    tail -c 2000 "$log" | tr -d '\r' >&2
+    fail "$what didn't show \"$want\" booting from a BIOS"
 }
 
 # make_stick <iso> <stick size> <scheme> [boot-craft options...]
@@ -133,6 +168,8 @@ losetup -d "$dev"
 dev=""
 pass "GPT drive: fsck.fat is clean, the files and autounattend.xml are there"
 boot_uefi "$work/stick.bin" "the GPT drive"
+boot_bios "$work/stick.bin" "the GPT drive" "starts in UEFI mode only"
+pass "the GPT drive tells a BIOS it's for UEFI"
 
 make_stick "$work/small.iso" 128M mbr
 check_stick mbr
@@ -142,7 +179,25 @@ losetup -d "$dev"
 dev=""
 pass "MBR drive: fsck.fat is clean, active FAT32 partition"
 boot_uefi "$work/stick.bin" "the MBR drive"
+boot_bios "$work/stick.bin" "the MBR drive" "$BIOS_MARKER"
+pass "the MBR drive boots from a BIOS: MBR, FAT32 boot code, all of BOOTMGR loaded"
+
+# A big stick: 32 KiB clusters and a FAT of many sectors (sparse: no space used).
+make_stick "$work/small.iso" 40G mbr
+losetup -d "$dev"
+dev=""
+boot_bios "$work/stick.bin" "the 40 GB MBR drive" "$BIOS_MARKER"
+pass "a 40 GB MBR drive boots from a BIOS too"
 rm -f "$work/small.iso"
+
+# An image without BOOTMGR (ARM64 ones, say) is UEFI only, and says so.
+make_iso uefi-only 1 no-bootmgr
+make_stick "$work/uefi-only.iso" 128M mbr
+losetup -d "$dev"
+dev=""
+boot_bios "$work/stick.bin" "the drive without BOOTMGR" "No BOOTMGR on this drive"
+pass "a drive without BOOTMGR tells a BIOS to use UEFI"
+rm -f "$work/uefi-only.iso"
 
 # --- A real-size install.wim over 4 GiB, split for FAT32. ---
 if [ "${BIG:-0}" = 1 ]; then

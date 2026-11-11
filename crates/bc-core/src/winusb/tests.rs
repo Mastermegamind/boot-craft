@@ -84,6 +84,8 @@ fn a_windows_iso_becomes_a_fat32_stick_with_the_same_files() {
     assert!(files.iter().any(|(p, b)| p == "sources/setup.dll" && b.len() == 3 << 20));
     assert!(files.iter().any(|(p, _)| p == "efi/boot/bootx64.efi"));
     assert_eq!(built.files.len(), expected.len());
+    assert!(!plan.bios(), "GPT: UEFI only");
+    assert_eq!(&image[..440], &include_bytes!("../../boot/mbr.bin")[..], "the protective MBR's code says so to a BIOS");
 
     verify(Cursor::new(image), DISK, 512, &built, None, &mut |_, _, _| {}).unwrap();
 }
@@ -98,6 +100,13 @@ fn mbr_sticks_have_an_active_fat32_partition() {
     assert_eq!((table.scheme, &table.parts[0].kind), (Scheme::Mbr, &PartType::Mbr(0x0C)));
     assert_eq!(image[446], 0x80, "active");
     assert!(files.iter().any(|(p, _)| p == "bootmgr"));
+    // BIOS boot: MBR code that starts the active partition, whose boot code
+    // loads bootmgr.
+    assert!(plan.bios());
+    assert_eq!(plan.starts_on(), "UEFI and BIOS PCs");
+    assert_eq!(&image[..440], &include_bytes!("../../boot/mbr.bin")[..]);
+    let vbr = &image[1 << 20..(1 << 20) + 512];
+    assert_eq!(vbr[90..510], include_bytes!("../../boot/fat32.bin")[90..510]);
 }
 
 #[test]

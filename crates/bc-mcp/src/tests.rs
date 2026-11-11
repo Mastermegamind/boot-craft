@@ -583,7 +583,8 @@ fn a_windows_iso_becomes_an_install_drive_in_two_steps() {
     let args = json!({ "image": iso, "drive": "sdb", "scheme": "mbr", "bypass_requirements": true, "local_account": "ada" });
     let (is_error, data) = h.call("prepare_write", args);
     assert!(!is_error, "{data}");
-    assert_eq!(data["windows"]["plan"], "MBR partition table, one FAT32 partition \"CCCOMA_X64F\", 11 files");
+    assert_eq!(data["windows"]["plan"], "MBR partition table, one FAT32 partition \"CCCOMA_X64F\", 11 files; starts on UEFI and BIOS PCs");
+    assert_eq!(data["windows"]["bios_boot"], true);
     assert_eq!(data["windows"]["setup_options"].as_array().unwrap().len(), 2);
     let token = data["token"].as_str().unwrap().to_string();
     let (is_error, data) = h.call("confirm_write", json!({ "token": token, "drive": "sdb" }));

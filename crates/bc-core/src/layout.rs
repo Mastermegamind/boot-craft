@@ -93,11 +93,16 @@ fn invalid(message: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
 }
 
+/// MBR boot code (`boot/mbr.asm`): starts the active partition, or on a
+/// protective MBR says the drive is for UEFI only.
+const MBR_CODE: &[u8; 440] = include_bytes!("../boot/mbr.bin");
+
 fn write_mbr<W: Write + Seek>(dev: &mut W, sector: u64, parts: &[NewPart]) -> io::Result<()> {
     if parts.len() > 4 {
         return Err(invalid("an MBR holds at most 4 partitions".into()));
     }
     let mut mbr = vec![0u8; sector as usize];
+    mbr[..440].copy_from_slice(MBR_CODE);
     mbr[440..444].copy_from_slice(&random_bytes::<4>());
     for (i, p) in parts.iter().enumerate() {
         let (lba, count) = (p.start / sector, p.size / sector);
@@ -138,8 +143,10 @@ fn write_gpt<W: Write + Seek>(dev: &mut W, disk: u64, sector: u64, parts: &[NewP
     let last_lba = lbas - 1;
     let table_sectors = gpt_table_sectors(sector);
 
-    // Protective MBR: one partition of type 0xEE over the whole drive.
+    // Protective MBR: one partition of type 0xEE over the whole drive. Its
+    // boot code tells a BIOS that the drive starts in UEFI mode only.
     let mut mbr = vec![0u8; sector as usize];
+    mbr[..440].copy_from_slice(MBR_CODE);
     let e = &mut mbr[446..462];
     e[1..4].copy_from_slice(&[0x00, 0x02, 0x00]);
     e[4] = 0xEE;

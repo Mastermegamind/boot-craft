@@ -65,7 +65,7 @@ impl Mode {
         match self {
             Mode::Raw => "raw write: copied byte for byte, then verified",
             Mode::WindowsFiles => {
-                "Windows install drive: a FAT32 partition with the ISO's files, for UEFI (install.wim split if over 4 GiB)"
+                "Windows install drive: a FAT32 partition with the ISO's files, for UEFI, and BIOS with MBR (install.wim split if over 4 GiB)"
             }
             Mode::BootloaderFiles => "file copy with a boot loader (GRUB / Syslinux) (coming in M4)",
             Mode::MacRecovery => "macOS recovery drive: GPT and HFS+ with the recovery image (coming in M4)",

@@ -97,7 +97,7 @@ struct WriteArgs {
 #[derive(Args, Default)]
 #[command(next_help_heading = "Windows install drives")]
 struct WindowsArgs {
-    /// Partition table: gpt (UEFI, the default) or mbr (UEFI on older firmware)
+    /// Partition table: gpt (UEFI only, the default) or mbr (UEFI and BIOS PCs)
     #[arg(long, value_enum, default_value_t = SchemeArg::Gpt)]
     scheme: SchemeArg,
     /// Windows 11: install without TPM 2.0, Secure Boot or 4 GB of RAM
@@ -451,7 +451,8 @@ fn write_windows(
     } else {
         eprintln!("Copied {count} files ({}); not read back (--no-verify).", size(written.built.bytes));
     }
-    eprintln!("Done. {} can be removed. Boot from it in UEFI mode to install Windows.", drive.name);
+    let mode = if plan.bios() { "in UEFI or BIOS mode" } else { "in UEFI mode" };
+    eprintln!("Done. {} can be removed. Boot from it {mode} to install Windows.", drive.name);
     Ok(())
 }
 

@@ -26,7 +26,7 @@ iso() { # iso <name> <label> <genisoimage options...>
 }
 
 # Windows 11 install ISO: UDF bridge, as Microsoft's oscdimg makes it.
-put windows bootmgr
+put windows bootmgr 'BOOTMGR stand-in\n'
 put windows bootmgr.efi
 put windows setup.exe
 put windows boot/etfsboot.com
