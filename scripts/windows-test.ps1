@@ -14,16 +14,16 @@ $vhd = Join-Path $work 'drive.vhd'
 function Pass($message) { Write-Host "PASS: $message" }
 function Fail($message) { Write-Host "FAIL: $message"; exit 1 }
 
-function DiskPart([string[]] $lines) {
+function Invoke-DiskPart([string[]] $lines) {
     $script = Join-Path $work 'diskpart.txt'
     Set-Content $script $lines -Encoding ascii
-    $out = diskpart /s $script | Out-String
+    $out = diskpart.exe /s $script | Out-String
     if ($LASTEXITCODE -ne 0) { Write-Host $out; throw "diskpart failed" }
     $out
 }
 
 function Attach {
-    DiskPart @("select vdisk file=`"$vhd`"", "attach vdisk") | Out-Null
+    Invoke-DiskPart @("select vdisk file=`"$vhd`"", "attach vdisk") | Out-Null
     Start-Sleep -Seconds 2
     $disk = Get-Disk | Where-Object { $_.Location -eq $vhd -or $_.BusType -eq 'File Backed Virtual' } | Select-Object -Last 1
     if (-not $disk) { throw "the VHD didn't show up as a disk" }
@@ -33,7 +33,7 @@ function Attach {
 # A fixed VHD is the disk's bytes followed by a footer: detach it and compare
 # its start with the image, without trusting boot-craft's own read-back.
 function Compare-WithImage([string] $what) {
-    DiskPart @("select vdisk file=`"$vhd`"", "detach vdisk") | Out-Null
+    Invoke-DiskPart @("select vdisk file=`"$vhd`"", "detach vdisk") | Out-Null
     $stream = [IO.File]::OpenRead($vhd)
     try {
         $written = New-Object byte[] $image.Length
@@ -64,7 +64,7 @@ try {
     $imageFile = Join-Path $work 'image.img'
     [IO.File]::WriteAllBytes($imageFile, $image)
 
-    DiskPart @("create vdisk file=`"$vhd`" maximum=64 type=fixed") | Out-Null
+    Invoke-DiskPart @("create vdisk file=`"$vhd`" maximum=64 type=fixed") | Out-Null
     $drive = Attach
     Write-Host "VHD disk: $drive"
 
@@ -90,7 +90,7 @@ try {
     Pass "a gzip image is decompressed while writing, verified, identical"
 
     $number = $drive.Substring(13)
-    DiskPart @("select disk $number", "clean", "create partition primary", "format fs=fat32 quick label=BCTEST", "assign letter=Q") | Out-Null
+    Invoke-DiskPart @("select disk $number", "clean", "create partition primary", "format fs=fat32 quick label=BCTEST", "assign letter=Q") | Out-Null
     Start-Sleep -Seconds 2
     $r = Write-Image $imageFile $drive @()
     if ($r.ok) { Fail "wrote a disk with a mounted volume" }
@@ -104,6 +104,6 @@ try {
 
     Write-Host "all Windows tests passed"
 } finally {
-    try { DiskPart @("select vdisk file=`"$vhd`"", "detach vdisk") | Out-Null } catch {}
+    try { Invoke-DiskPart @("select vdisk file=`"$vhd`"", "detach vdisk") | Out-Null } catch {}
     Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue
 }

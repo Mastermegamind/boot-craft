@@ -373,7 +373,7 @@ mod tests {
         let mut d = vec![0u8; 40];
         d.extend(b"  SanDisk \0Ultra\0");
         assert_eq!(text_at(&d, Some(40)).as_deref(), Some("SanDisk"));
-        assert_eq!(text_at(&d, Some(50)).as_deref(), Some("Ultra"));
+        assert_eq!(text_at(&d, Some(51)).as_deref(), Some("Ultra"));
         assert_eq!(text_at(&d, Some(0)), None);
         assert_eq!(text_at(&d, Some(999)), None);
     }

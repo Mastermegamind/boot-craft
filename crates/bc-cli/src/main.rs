@@ -31,6 +31,9 @@ enum Command {
         /// Offer loop devices too (for testing)
         #[arg(long)]
         allow_loop: bool,
+        /// Keep watching, and list again whenever a drive comes, goes or changes
+        #[arg(long)]
+        watch: bool,
     },
     /// Show what an image is and whether a raw write will boot
     Info { image: PathBuf },
@@ -119,7 +122,10 @@ fn stop_on_ctrl_c() -> Arc<AtomicBool> {
 
 fn run(cli: Cli) -> Result {
     match cli.command {
-        Command::List { allow_loop } => list(&Policy { allow_loop, ..Policy::default() }),
+        Command::List { allow_loop, watch } => {
+            let policy = Policy { allow_loop, ..Policy::default() };
+            if watch { watch_drives(&policy) } else { list(&platform::list_drives()?, &policy) }
+        }
         Command::Info { image } => info(&image),
         Command::Hash { file } => {
             let digest = hash_file(&file, &stop_on_ctrl_c())?;
@@ -134,14 +140,30 @@ fn run(cli: Cli) -> Result {
     }
 }
 
-fn list(policy: &Policy) -> Result {
-    let drives = platform::list_drives()?;
+/// Lists the drives, then again each time they change, until Ctrl-C.
+fn watch_drives(policy: &Policy) -> Result {
+    let mut shown: Option<Vec<Drive>> = None;
+    loop {
+        let drives = platform::list_drives()?;
+        if shown.as_ref() != Some(&drives) {
+            if shown.is_some() {
+                println!();
+            }
+            println!("Drives (watching for changes; Ctrl-C to stop):");
+            list(&drives, policy)?;
+            shown = Some(drives);
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+fn list(drives: &[Drive], policy: &Policy) -> Result {
     if drives.is_empty() {
         println!("No drives found.");
         return Ok(());
     }
     println!("{:<10} {:>10}  {:<8}  {:<28}  STATUS", "DRIVE", "SIZE", "TYPE", "MODEL");
-    for drive in &drives {
+    for drive in drives {
         let status = match drive.check(policy) {
             Ok(()) => "can be written".to_string(),
             Err(reason) => format!("refused: {reason}"),
