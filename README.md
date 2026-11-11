@@ -6,8 +6,8 @@ what [Rufus](https://rufus.ie) does on Windows, sharing none of its code.
 
 > **Status: early.** Raw writing with verification works on Linux, macOS
 > and Windows, for plain and compressed images, and Windows 10/11 install
-> drives (FAT32, for UEFI and BIOS PCs) can be made from Windows ISOs. NTFS
-> mode for Windows, and the other image types, come next. See
+> drives (FAT32 for UEFI and BIOS PCs, or NTFS) can be made from Windows ISOs.
+> The other image types come next. See
 > [PLAN.md](PLAN.md) for the roadmap and [GOAL.md](GOAL.md) for what we're
 > building and why.
 
@@ -22,7 +22,7 @@ written. `boot-craft info` says what it found and why.
 | Linux hybrid ISOs | Ubuntu, Fedora, Debian, Mint, Arch, Kali, Parrot, Tails | raw write + verify | done |
 | BSD, ChromeOS Flex, ARM boards | FreeBSD memstick, ChromeOS Flex `.bin`, Raspberry Pi OS `.img` | raw write + verify | done |
 | Compressed images | `.xz`, `.gz`, `.zst`, `.bz2`, `.zip`, fixed `.vhd` | decompressed while writing | done |
-| Windows install ISOs | Windows 10 / 11, Server | FAT32 file copy for UEFI and BIOS, `install.wim` split if over 4 GiB, Windows 11 setup options | done; NTFS mode planned (M3) |
+| Windows install ISOs | Windows 10 / 11, Server | FAT32 file copy for UEFI and BIOS, `install.wim` split if over 4 GiB, NTFS + UEFI:NTFS, Windows 11 setup options | done |
 | Windows PE ISOs | Hiren's BootCD PE | FAT32 file copy for UEFI | done |
 | Non-hybrid Linux / rescue ISOs | older distros | file copy + GRUB / Syslinux | planned (M4) |
 | macOS | recovery (`BaseSystem.dmg`) from any OS; full installer on a Mac | HFS+ / `createinstallmedia` | planned (M4) |
@@ -35,8 +35,7 @@ written. `boot-craft info` says what it found and why.
 | List safe drives | done | done | done |
 | Raw write + verify | done | done | done |
 | Recognise every image type | done | done | done |
-| Windows install USB (UEFI, BIOS) + Windows 11 options | done | done | done |
-| Windows: NTFS mode | planned (M3) | planned (M3) | planned (M3) |
+| Windows install USB (UEFI, BIOS, NTFS) + Windows 11 options | done | done | done |
 | Other ISOs, macOS media, FreeDOS | planned (M4) | planned (M4) | planned (M4) |
 | GUI | planned (M5) | planned (M5) | planned (M5) |
 
@@ -103,8 +102,17 @@ Which PCs start the drive:
   code (`crates/bc-core/boot/`, a few hundred bytes of assembly) that loads
   Windows' `bootmgr`. ISOs without `bootmgr` (ARM64 ones) are UEFI only.
 
-ISOs with a single file over 4 GiB besides `install.wim` need NTFS, which
-isn't done yet; they're refused before anything is erased.
+**NTFS.** ISOs with a file over 4 GiB that can't be split (anything but
+`install.wim`) get NTFS instead of FAT32, and `--filesystem ntfs` asks for it
+for any ISO. boot-craft writes the NTFS itself, as it does FAT32. UEFI
+firmware can't read NTFS, so the drive also gets a 1 MiB boot partition
+with Rufus's [UEFI:NTFS](https://github.com/pbatard/uefi-ntfs) loader, which
+loads an NTFS driver and starts Windows from the NTFS partition. It is
+Secure Boot signed, though some PCs need "third-party certificates" allowed
+in their Secure Boot settings. It's GPL, so it isn't built into boot-craft:
+put Rufus's [`uefi-ntfs.img`](https://github.com/pbatard/rufus/tree/master/res/uefi)
+beside boot-craft, or pass `--uefi-ntfs FILE`. NTFS drives start on UEFI
+PCs only.
 
 ## AI agents (MCP)
 

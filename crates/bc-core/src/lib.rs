@@ -16,6 +16,7 @@ pub mod fat32;
 pub mod hash;
 pub mod image;
 pub mod layout;
+pub mod ntfs;
 pub mod partitions;
 pub mod platform;
 pub mod source;

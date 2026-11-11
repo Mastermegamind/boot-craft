@@ -208,12 +208,20 @@ Rules:
       SeaBIOS in QEMU booting MBR sticks (128 MB and 40 GB) to a stand-in
       `bootmgr` that checks every sector of itself arrived; not yet with
       Microsoft's real `bootmgr`
-- [ ] **NTFS mode**: NTFS data partition plus a small FAT partition with a
-      UEFI:NTFS-style loader; NTFS formatting via the OS on Windows, bundled
-      `mkntfs` on Linux and macOS. Needed for ISOs with another file over
-      4 GiB, or an install.wim with one file inside over 4 GiB
-- [ ] Pick FAT32 or NTFS mode automatically and say why (FAT32 only so far;
-      what it can't hold is refused before anything is erased)
+- [x] **NTFS mode** (`ntfs.rs`): our own write-once NTFS 3.1 writer, the
+      same on every OS (instead of the planned OS formatter plus `mkntfs`,
+      which would still have needed a way to copy files in without mounting):
+      4 KiB clusters, files contiguous, B-tree folder indexes, `$Secure`,
+      `$Extend`, Windows' own upper-case table, an empty `$LogFile`. Plus a
+      1 MiB partition with Rufus's `uefi-ntfs.img` (GPL, found beside
+      boot-craft or given with `--uefi-ntfs`, never built in). Chosen by
+      itself when a file over 4 GiB can't be split; `--filesystem ntfs` for
+      any ISO. Read back through the `ntfs` crate. Tested: ntfs-3g and the
+      `ntfs` crate read every file (folders of 3000 files, 4 KiB sectors);
+      on loop devices ntfs-3g and the Linux kernel's driver mount it, and
+      QEMU/OVMF boots it through the real UEFI:NTFS; on Windows, chkdsk finds
+      no problems and Windows reads every file
+- [x] Pick FAT32 or NTFS automatically and say why (`--filesystem` to choose)
 - [ ] A real Windows ISO through the weekly real-image job (Microsoft's
       download links expire, so it needs a stored copy)
 

@@ -7,6 +7,11 @@
 # is also booted from a BIOS (SeaBIOS), through boot-craft's boot code to a
 # stand-in BOOTMGR (fake-bootmgr.asm) that checks how it was loaded.
 #
+# An NTFS stick (--filesystem ntfs) is checked by ntfs-3g and, when the
+# kernel has one, its own NTFS driver, then booted with UEFI through Rufus's
+# real UEFI:NTFS loader (uefi-ntfs.img, downloaded at a pinned checksum, or
+# UEFI_NTFS=path) to the same marker on the NTFS partition.
+#
 # With BIG=1 it also does what current Windows ISOs need: an install.wim
 # over 4 GiB, which has to be split into .swm parts for FAT32. That needs
 # about 13 GiB of free disk space and a few minutes.
@@ -21,7 +26,7 @@ cd "$(dirname "$0")/.."
 BIN=$(realpath "${BIN:-target/debug/boot-craft}")
 [ -x "$BIN" ] || { echo "build first: cargo build" >&2; exit 1; }
 [ "$(id -u)" = 0 ] || { echo "needs root: sudo $0" >&2; exit 1; }
-for tool in nasm python3 genisoimage wimlib-imagex grub-mkstandalone fsck.fat qemu-system-x86_64; do
+for tool in nasm python3 curl ntfs-3g genisoimage wimlib-imagex grub-mkstandalone fsck.fat qemu-system-x86_64; do
     command -v "$tool" >/dev/null || { echo "needs $tool" >&2; exit 1; }
 done
 OVMF=$(ls /usr/share/ovmf/OVMF.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/qemu/OVMF.fd 2>/dev/null | head -1 || true)
@@ -198,6 +203,44 @@ dev=""
 boot_bios "$work/stick.bin" "the drive without BOOTMGR" "No BOOTMGR on this drive"
 pass "a drive without BOOTMGR tells a BIOS to use UEFI"
 rm -f "$work/uefi-only.iso"
+
+# --- NTFS, booted through Rufus's UEFI:NTFS loader. ---
+UEFI_NTFS_SHA256=72683fa1250eeea772d3399277b434d4e55ba8dd0dc926e52d817e701fc2eb9e
+UEFI_NTFS_URL=https://raw.githubusercontent.com/pbatard/rufus/master/res/uefi/uefi-ntfs.img
+loader=${UEFI_NTFS:-$work/uefi-ntfs.img}
+[ -f "$loader" ] || curl -fsSL -o "$loader" "$UEFI_NTFS_URL" || fail "can't download uefi-ntfs.img"
+if [ -z "${UEFI_NTFS:-}" ] && ! echo "$UEFI_NTFS_SHA256  $loader" | sha256sum -c --quiet; then
+    fail "uefi-ntfs.img has changed upstream: check it and update UEFI_NTFS_SHA256"
+fi
+make_iso ntfs 8
+for scheme in gpt mbr; do
+    make_stick "$work/ntfs.iso" 256M "$scheme" --filesystem ntfs --uefi-ntfs "$loader"
+    udevadm settle 2>/dev/null || true
+    [ "$(blkid -o value -s TYPE "${dev}p1")" = ntfs ] || fail "no NTFS partition 1"
+    [ "$(blkid -o value -s LABEL "${dev}p1")" = "CCCOMA_X64FRE_EN-US_DV9" ] || fail "wrong NTFS label"
+    [ "$(blkid -o value -s LABEL "${dev}p2")" = "RUFUS_BOOT" ] || fail "no UEFI:NTFS partition 2"
+    ntfsfix -n "${dev}p1" >"$work/ntfsfix.log" 2>&1 || { cat "$work/ntfsfix.log" >&2; fail "ntfsfix found problems"; }
+    # The same files through ntfs-3g and (if there is one) the kernel's driver.
+    mkdir -p "$mnt" "$work/iso"
+    mount -o ro,loop "$work/ntfs.iso" "$work/iso"
+    for driver in ntfs-3g ntfs3 ntfs; do
+        if [ "$driver" = ntfs-3g ]; then
+            ntfs-3g -o ro "${dev}p1" "$mnt" || fail "ntfs-3g can't mount it"
+        else
+            modprobe "$driver" 2>/dev/null || continue
+            mount -t "$driver" -o ro "${dev}p1" "$mnt" 2>/dev/null || { echo "note: the kernel's $driver driver didn't mount it" >&2; continue; }
+        fi
+        diff -r "$work/iso" "$mnt" >"$work/diff.log" 2>&1 || { umount "$mnt"; umount "$work/iso"; cat "$work/diff.log" >&2; fail "$driver reads different files"; }
+        umount "$mnt"
+        pass "NTFS ($scheme): $driver reads every file as the ISO has it"
+        [ "$driver" = ntfs-3g ] || break
+    done
+    umount "$work/iso"
+    losetup -d "$dev"
+    dev=""
+    boot_uefi "$work/stick.bin" "the NTFS drive ($scheme), through UEFI:NTFS,"
+done
+rm -f "$work/ntfs.iso"
 
 # --- A real-size install.wim over 4 GiB, split for FAT32. ---
 if [ "${BIG:-0}" = 1 ]; then

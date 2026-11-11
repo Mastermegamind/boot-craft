@@ -236,3 +236,93 @@ fn labels() {
     assert_eq!(fat_label("Win 11 été"), "WIN 11 _T_");
     assert_eq!(fat_label("  "), "WINDOWS");
 }
+
+/// A stand-in for Rufus's UEFI:NTFS image: 1 MiB of FAT with the loader's path.
+fn uefi_ntfs_image(dir: &tempfile::TempDir) -> PathBuf {
+    let mut image = Cursor::new(vec![0u8; 1 << 20]);
+    fatfs::format_volume(&mut image, fatfs::FormatVolumeOptions::new().volume_label(*b"RUFUS_BOOT ")).unwrap();
+    {
+        let fs = fatfs::FileSystem::new(&mut image, fatfs::FsOptions::new()).unwrap();
+        let boot = fs.root_dir().create_dir("EFI").unwrap().create_dir("Boot").unwrap();
+        boot.create_file("bootx64.efi").unwrap().write_all(b"MZ stand-in loader").unwrap();
+    }
+    let path = dir.path().join("uefi-ntfs.img");
+    fs::write(&path, image.into_inner()).unwrap();
+    path
+}
+
+#[test]
+fn ntfs_sticks_have_the_files_and_a_uefi_ntfs_partition() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = iso_file(&dir, "windows.iso.gz");
+    let loader = uefi_ntfs_image(&dir);
+    for scheme in [Scheme::Gpt, Scheme::Mbr] {
+        let options = Options { scheme, filesystem: FileSystem::Ntfs, uefi_ntfs: Some(loader.clone()), ..Options::default() };
+        let (source, plan) = planned(&path, &options).unwrap();
+        assert_eq!(plan.filesystem, FileSystem::Ntfs);
+        assert_eq!(plan.label, "CCCOMA_X64FRE_EN-US_DV9", "NTFS keeps the whole label");
+        assert!(!plan.bios());
+        assert!(plan.describe().contains("NTFS partition"), "{}", plan.describe());
+        let (built, image) = make(&source, &plan, &Prepared::default());
+        assert_eq!(built.filesystem, FileSystem::Ntfs);
+
+        let table = partitions::read(&mut Cursor::new(&image)).unwrap().unwrap();
+        assert_eq!(table.parts.len(), 2);
+        let (data, boot) = (&table.parts[0], &table.parts[1]);
+        match scheme {
+            Scheme::Gpt => assert!(data.is(guid::MICROSOFT_DATA) && boot.is(guid::EFI_SYSTEM)),
+            Scheme::Mbr => assert_eq!((&data.kind, &boot.kind), (&PartType::Mbr(0x07), &PartType::Mbr(0xEF))),
+        }
+        assert_eq!(&image[data.start as usize + 3..data.start as usize + 11], b"NTFS    ");
+        assert_eq!(boot.size, 1 << 20);
+        assert!(image[boot.start as usize..(boot.start + boot.size) as usize] == fs::read(&loader).unwrap()[..]);
+        assert_eq!((data.start + data.size) % (1 << 20), 0);
+
+        // Every file, read back through the ntfs crate, is the ISO's.
+        let mut tree = Tree::open(File::open(&path).unwrap()).unwrap().unwrap();
+        let mut volume = Cursor::new(image[data.start as usize..(data.start + data.size) as usize].to_vec());
+        let reader = ntfs::Reader::new(&mut volume).unwrap();
+        for (p, e) in tree.walk(1000).unwrap().into_iter().filter(|(_, e)| !e.is_dir) {
+            let mut want = Vec::new();
+            tree.reader(&e).read_to_end(&mut want).unwrap();
+            let mut got = Vec::new();
+            reader
+                .read(&mut volume, &p, &mut |b| {
+                    got.extend_from_slice(b);
+                    Ok(())
+                })
+                .unwrap();
+            assert!(got == want, "{p}");
+        }
+        verify(Cursor::new(image.clone()), DISK, 512, &built, None, &mut |_, _, _| {}).unwrap();
+
+        // And verification catches a changed byte.
+        let mut damaged = image;
+        let at = damaged.windows(11).position(|w| w == b"[BUILDINFO]").unwrap();
+        damaged[at + 3] ^= 1;
+        assert!(matches!(verify(Cursor::new(damaged), DISK, 512, &built, None, &mut |_, _, _| {}), Err(Error::FileMismatch { .. })));
+    }
+}
+
+#[test]
+fn ntfs_is_chosen_when_a_big_file_cant_be_split() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = iso_file(&dir, "windows.iso.gz");
+    let loader = uefi_ntfs_image(&dir);
+    // Pretend FAT32 holds 1 MiB: setup.dll (3 MiB) is then too big, and not a WIM.
+    let small = Options { split_over: 1 << 20, uefi_ntfs: Some(loader.clone()), ..Options::default() };
+    let (_, plan) = planned(&path, &small).unwrap();
+    assert_eq!(plan.filesystem, FileSystem::Ntfs);
+    assert!(plan.split.is_none());
+    // FAT32 asked for: refused, saying why.
+    let err = planned(&path, &Options { filesystem: FileSystem::Fat32, ..small.clone() }).unwrap_err().to_string();
+    assert!(err.contains("sources/setup.dll") && err.contains("NTFS"), "{err}");
+    // No UEFI:NTFS image: refused, saying where to get one.
+    let err = planned(&path, &Options { uefi_ntfs: None, ..small.clone() }).unwrap_err().to_string();
+    assert!(err.contains("setup.dll") && err.contains("uefi-ntfs.img"), "{err}");
+    // Not a UEFI:NTFS image.
+    let err = planned(&path, &Options { uefi_ntfs: Some(path.clone()), ..small }).unwrap_err().to_string();
+    assert!(err.contains("isn't a UEFI:NTFS image"), "{err}");
+    // Nothing too big: FAT32.
+    assert_eq!(planned(&path, &Options::default()).unwrap().1.filesystem, FileSystem::Fat32);
+}

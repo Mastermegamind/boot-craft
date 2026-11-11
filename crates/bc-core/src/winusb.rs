@@ -8,6 +8,12 @@
 //! bigger. Such a WIM is split into `install.swm` parts with wimlib (Setup
 //! reads split images), before anything on the drive is touched.
 //!
+//! Other files that big can't be split: those images get NTFS instead (or
+//! any image, asked for). UEFI firmware only reads FAT, so an NTFS stick
+//! also gets a 1 MiB FAT partition holding Rufus's UEFI:NTFS loader
+//! (`uefi-ntfs.img`, a separate GPL program found like wimlib), which loads
+//! an NTFS driver and starts Windows' boot loader from the NTFS partition.
+//!
 //! The steps, in order:
 //! 1. [`plan`]: what will be copied, and refusals (nothing is touched);
 //! 2. [`prepare`]: split `install.wim` into a temporary folder if need be;
@@ -29,6 +35,7 @@ use crate::error::Error;
 use crate::fat32;
 use crate::hash::{CHUNK, Sha256Digest, read_some, to_hex};
 use crate::layout::{self, Content, NewPart, Scheme};
+use crate::ntfs;
 use crate::source::{Compression, Source};
 use crate::tree::{Entry, Tree};
 use crate::unattend;
@@ -39,6 +46,19 @@ pub const FAT32_MAX_FILE: u64 = 0xFFFF_FFFF;
 const SPLIT_PART_MIB: u32 = 3800;
 /// An ISO has at most this many files and folders.
 const MAX_ENTRIES: usize = 100_000;
+/// The UEFI:NTFS partition: Rufus's image, written as it is.
+pub const UEFI_NTFS_IMAGE: &str = "uefi-ntfs.img";
+const UEFI_NTFS_BYTES: u64 = 1 << 20;
+
+/// The file system for the files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FileSystem {
+    /// FAT32, unless a file over 4 GiB can't be split: then NTFS.
+    #[default]
+    Auto,
+    Fat32,
+    Ntfs,
+}
 
 /// How to make the stick.
 #[derive(Debug, Clone)]
@@ -54,6 +74,10 @@ pub struct Options {
     pub split_over: u64,
     /// Split part size in MiB (lower only in tests).
     pub split_part_mib: u32,
+    pub filesystem: FileSystem,
+    /// Rufus's UEFI:NTFS partition image, for NTFS (default: found beside
+    /// boot-craft or on the PATH).
+    pub uefi_ntfs: Option<PathBuf>,
 }
 
 impl Default for Options {
@@ -64,6 +88,8 @@ impl Default for Options {
             temp_dir: None,
             split_over: FAT32_MAX_FILE,
             split_part_mib: SPLIT_PART_MIB,
+            filesystem: FileSystem::Auto,
+            uefi_ntfs: None,
         }
     }
 }
@@ -82,8 +108,12 @@ pub struct Split {
 #[derive(Debug, Clone)]
 pub struct Plan {
     pub scheme: Scheme,
-    /// The FAT volume label (from the ISO's).
+    /// FAT32 or NTFS (never Auto).
+    pub filesystem: FileSystem,
+    /// The volume label (from the ISO's).
     pub label: String,
+    /// NTFS: the UEFI:NTFS partition image.
+    pub uefi_ntfs: Option<PathBuf>,
     /// Every folder and file in the image, parents first.
     entries: Vec<(String, Entry)>,
     /// Bytes of files to copy (the WIM counted whole if it's split).
@@ -105,8 +135,13 @@ impl Plan {
     pub fn fits(&self, drive: u64) -> Result<(), Error> {
         let cluster = 32 << 10;
         let data: u64 = self.entries.iter().map(|(_, e)| if e.is_dir { cluster } else { e.size.div_ceil(cluster) * cluster }).sum();
-        // Two FATs of 4 bytes per cluster, the 1 MiB before the partition, the GPT backup, and some spare.
-        let needed = data + data / cluster * 8 + (32 << 20);
+        let needed = match self.filesystem {
+            // A file record each, $LogFile (1% of the drive, 64 MiB at most), the
+            // UEFI:NTFS partition, the 1 MiB before the partition, spare.
+            FileSystem::Ntfs => data + self.entries.len() as u64 * 4096 + (drive / 100).clamp(2 << 20, 64 << 20) + (8 << 20),
+            // Two FATs of 4 bytes per cluster, the 1 MiB before the partition, the GPT backup, and some spare.
+            _ => data + data / cluster * 8 + (32 << 20),
+        };
         if needed > drive { Err(Error::TooSmall { image: needed, drive }) } else { Ok(()) }
     }
 
@@ -115,7 +150,15 @@ impl Plan {
             Scheme::Gpt => "GPT",
             Scheme::Mbr => "MBR",
         };
-        let mut text = format!("{scheme} partition table, one FAT32 partition \"{}\", {} files", self.label, self.files);
+        let mut text = match self.filesystem {
+            FileSystem::Ntfs => {
+                format!(
+                    "{scheme} partition table, an NTFS partition \"{}\" with {} files and a 1 MiB UEFI:NTFS boot partition",
+                    self.label, self.files
+                )
+            }
+            _ => format!("{scheme} partition table, one FAT32 partition \"{}\", {} files", self.label, self.files),
+        };
         if let Some(split) = &self.split {
             text.push_str(&format!("; {} ({} bytes) is split into .swm parts for FAT32", split.path, split.size));
         }
@@ -127,11 +170,14 @@ impl Plan {
     /// Whether a BIOS (not just UEFI) can start the stick: it needs MBR and
     /// an image with `bootmgr`.
     pub fn bios(&self) -> bool {
-        self.scheme == Scheme::Mbr && self.bootmgr
+        self.scheme == Scheme::Mbr && self.bootmgr && self.filesystem == FileSystem::Fat32
     }
 
     /// Which PCs the stick starts, and if only UEFI ones, why.
     pub fn starts_on(&self) -> &'static str {
+        if self.filesystem == FileSystem::Ntfs {
+            return "UEFI PCs, through the UEFI:NTFS loader (NTFS has no BIOS boot here; with Secure Boot, allow third-party certificates)";
+        }
         match (self.scheme, self.bootmgr) {
             (Scheme::Mbr, true) => "UEFI and BIOS PCs",
             (Scheme::Gpt, true) => "UEFI PCs (with --scheme mbr, BIOS PCs too)",
@@ -164,15 +210,25 @@ pub fn plan(source: &Source, detected: &Detected, options: &Options) -> Result<P
     if entries.len() >= MAX_ENTRIES {
         return Err(Error::UnsupportedImage(format!("more than {MAX_ENTRIES} files in the image")));
     }
+    // FAT32 unless something too big for it can't be split (or NTFS was asked for).
+    let is_install = |path: &str| ["sources/install.wim", "sources/install.esd"].iter().any(|p| path.eq_ignore_ascii_case(p));
+    let unsplittable = entries.iter().find(|(path, e)| !e.is_dir && e.size > options.split_over && !is_install(path));
+    let filesystem = match (options.filesystem, unsplittable) {
+        (FileSystem::Auto, Some(_)) | (FileSystem::Ntfs, _) => FileSystem::Ntfs,
+        _ => FileSystem::Fat32,
+    };
+    let uefi_ntfs = match filesystem {
+        FileSystem::Ntfs => Some(uefi_ntfs_image(options, unsplittable.map(|(p, e)| (p.as_str(), e.size)))?),
+        _ => None,
+    };
     let mut split = None;
     for (path, entry) in entries.iter().filter(|(_, e)| !e.is_dir) {
-        if entry.size <= options.split_over {
+        if entry.size <= options.split_over || filesystem == FileSystem::Ntfs {
             continue;
         }
-        let is_install = ["sources/install.wim", "sources/install.esd"].iter().any(|p| path.eq_ignore_ascii_case(p));
-        if !is_install || split.is_some() {
+        if !is_install(path) || split.is_some() {
             return Err(Error::UnsupportedImage(format!(
-                "{path} is {} bytes, more than FAT32 holds, and only install.wim can be split; this needs NTFS mode (not built yet)",
+                "{path} is {} bytes, more than FAT32 holds, and only install.wim can be split; leave out --filesystem fat32 to use NTFS",
                 entry.size
             )));
         }
@@ -188,11 +244,16 @@ pub fn plan(source: &Source, detected: &Detected, options: &Options) -> Result<P
     let files = entries.iter().filter(|(_, e)| !e.is_dir).count() + usize::from(unattend_xml.is_some());
     let bytes =
         entries.iter().map(|(_, e)| if e.is_dir { 0 } else { e.size }).sum::<u64>() + unattend_xml.as_ref().map_or(0, |x| x.len() as u64);
-    let label = header_label(source).map(|l| fat_label(&l)).unwrap_or_else(|| "WINDOWS".into());
+    let label = match filesystem {
+        FileSystem::Ntfs => header_label(source).map(|l| l.trim().chars().take(32).collect()).unwrap_or_else(|| "WINDOWS".into()),
+        _ => header_label(source).map(|l| fat_label(&l)).unwrap_or_else(|| "WINDOWS".into()),
+    };
     let bootmgr = entries.iter().any(|(path, e)| !e.is_dir && e.size > 0 && path.eq_ignore_ascii_case("bootmgr"));
     Ok(Plan {
         scheme: options.scheme,
+        filesystem,
         label,
+        uefi_ntfs,
         entries,
         bytes,
         files,
@@ -203,6 +264,39 @@ pub fn plan(source: &Source, detected: &Detected, options: &Options) -> Result<P
         split_part_mib: options.split_part_mib,
         temp_dir: options.temp_dir.clone(),
     })
+}
+
+/// Rufus's UEFI:NTFS partition image: the one given, or found beside
+/// boot-craft or on the PATH. Checked to be a FAT image with an x64 loader.
+fn uefi_ntfs_image(options: &Options, why: Option<(&str, u64)>) -> Result<PathBuf, Error> {
+    let reason = match why {
+        Some((path, size)) => format!("{path} is {size} bytes, too big for FAT32 and not splittable, so this image needs NTFS"),
+        None => "NTFS was asked for".into(),
+    };
+    let found = options.uefi_ntfs.clone().or_else(|| find_file(UEFI_NTFS_IMAGE));
+    let Some(path) = found else {
+        return Err(Error::UnsupportedImage(format!(
+            "{reason}. NTFS sticks need Rufus's UEFI:NTFS boot partition image, {UEFI_NTFS_IMAGE}, beside boot-craft or given with \
+             --uefi-ntfs (from https://github.com/pbatard/rufus/tree/master/res/uefi; it's GPL, so it isn't built in)"
+        )));
+    };
+    let bad = |why: &str| Error::UnsupportedImage(format!("{} isn't a UEFI:NTFS image: {why}", path.display()));
+    let bytes = fs::read(&path).map_err(|e| bad(&e.to_string()))?;
+    if bytes.len() as u64 != UEFI_NTFS_BYTES {
+        return Err(bad(&format!("{} bytes, not 1 MiB", bytes.len())));
+    }
+    let fat = fatfs::FileSystem::new(io::Cursor::new(bytes), fatfs::FsOptions::new()).map_err(|e| bad(&e.to_string()))?;
+    if fat.root_dir().open_file("EFI/Boot/bootx64.efi").is_err() {
+        return Err(bad("no EFI/Boot/bootx64.efi in it"));
+    }
+    Ok(path)
+}
+
+/// A data file beside boot-craft (or in ../share/boot-craft, as packages put it).
+fn find_file(name: &str) -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    [dir.join(name), dir.join("../share/boot-craft").join(name)].into_iter().find(|p| p.is_file())
 }
 
 fn header_label(source: &Source) -> Option<String> {
@@ -325,7 +419,7 @@ pub fn prepare(
         if meta.len() > FAT32_MAX_FILE {
             return Err(Error::UnsupportedImage(format!(
                 "splitting {} left {name} at {} bytes, still too big for FAT32: one file inside it is over 4 GiB. \
-                 This image needs NTFS mode (not built yet)",
+                 Make the stick with --filesystem ntfs",
                 split.path,
                 meta.len()
             )));
@@ -358,8 +452,9 @@ pub struct Built {
     /// (path, size, SHA-256) of every file written.
     pub files: Vec<(String, u64, Sha256Digest)>,
     pub bytes: u64,
-    /// The FAT32 partition: byte offset and size.
+    /// The partition with the files: byte offset and size.
     pub partition: (u64, u64),
+    pub filesystem: FileSystem,
 }
 
 /// Erases `dev` (a `disk`-byte drive with `sector`-byte sectors) and makes
@@ -378,8 +473,24 @@ pub fn build<D: Read + Write + Seek>(
     let disk = disk / sector as u64 * sector as u64;
     plan.fits(disk)?;
     let (start, end) = layout::usable(disk, sector as u64);
-    // FAT32 counts sectors in 32 bits: past that, the rest of the drive stays unused.
-    let size = (end - start).min(u64::from(u32::MAX) * sector as u64);
+    let ntfs = plan.filesystem == FileSystem::Ntfs;
+    let loader = match (&plan.uefi_ntfs, ntfs) {
+        (Some(path), true) => {
+            if sector != 512 {
+                return Err(Error::UnsupportedImage("the UEFI:NTFS image is made for 512-byte sectors; this drive has larger ones".into()));
+            }
+            Some(fs::read(path)?)
+        }
+        (None, true) => return Err(Error::UnsupportedImage("NTFS needs the UEFI:NTFS image".into())),
+        _ => None,
+    };
+    let size = if ntfs {
+        // The UEFI:NTFS partition takes the last aligned MiB.
+        (end - UEFI_NTFS_BYTES) / layout::ALIGN * layout::ALIGN - start
+    } else {
+        // FAT32 counts sectors in 32 bits: past that, the rest of the drive stays unused.
+        (end - start).min(u64::from(u32::MAX) * sector as u64)
+    };
     let partition = (start, size);
 
     // What goes where, worked out in full before the drive is touched.
@@ -410,16 +521,33 @@ pub fn build<D: Read + Write + Seek>(
         from.push(From::Bytes(xml.as_bytes()));
     }
     let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
-    let volume_id = u32::from_le_bytes(layout::random_bytes::<4>());
-    let fat =
-        fat32::layout(size, sector as u32, start, &plan.label, volume_id, items.clone(), fat32::dos_stamp(now)).map_err(|e| match e {
-            Error::TooSmall { image, .. } => Error::TooSmall { image: image + start + (1 << 20), drive: disk },
-            other => other,
-        })?;
+    let too_small = |e| match e {
+        Error::TooSmall { image, .. } => Error::TooSmall { image: image + start + (2 << 20), drive: disk },
+        other => other,
+    };
+    let volume = if ntfs {
+        let serial = u64::from_le_bytes(layout::random_bytes::<8>());
+        Volume::Ntfs(ntfs::layout(size, sector as u32, start, &plan.label, serial, items.clone(), now).map_err(too_small)?)
+    } else {
+        let volume_id = u32::from_le_bytes(layout::random_bytes::<4>());
+        Volume::Fat32(
+            fat32::layout(size, sector as u32, start, &plan.label, volume_id, items.clone(), fat32::dos_stamp(now)).map_err(too_small)?,
+        )
+    };
 
     let mut cache = Cache::new(dev, disk, sector)?;
-    let part = NewPart { start, size, content: Content::Fat32, name: "Windows".into(), bootable: true };
-    layout::write(&mut cache, disk, sector as u64, plan.scheme, &[part])?;
+    let mut parts =
+        vec![NewPart { start, size, content: if ntfs { Content::Ntfs } else { Content::Fat32 }, name: "Windows".into(), bootable: !ntfs }];
+    if loader.is_some() {
+        parts.push(NewPart {
+            start: start + size,
+            size: UEFI_NTFS_BYTES,
+            content: Content::EfiSystem,
+            name: "UEFI:NTFS".into(),
+            bootable: false,
+        });
+    }
+    layout::write(&mut cache, disk, sector as u64, plan.scheme, &parts)?;
     // No old file system's boot sector is left at the partition's start while the files go on.
     cache.write_at(start, &vec![0u8; (1 << 20).min(size as usize)])?;
 
@@ -434,7 +562,7 @@ pub fn build<D: Read + Write + Seek>(
             From::Local(path) => &mut File::open(path)?,
             From::Bytes(bytes) => &mut &bytes[..],
         };
-        let at = fat.data_offset(index).map_or(0, |o| start + o);
+        let at = volume.data_offset(index).map_or(0, |o| start + o);
         let mut out = At { cache: &mut cache, pos: at };
         let base = done;
         let digest = copy(reader, &mut out, item.size, cancel, &mut |n| progress(Step::Copying, base + n, total))
@@ -450,9 +578,29 @@ pub fn build<D: Read + Write + Seek>(
     if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
         return Err(Error::Cancelled);
     }
-    fat32::write_tables(&mut cache, start, &fat)?;
+    match &volume {
+        Volume::Fat32(fat) => fat32::write_tables(&mut cache, start, fat)?,
+        Volume::Ntfs(layout) => ntfs::write_tables(&mut cache, start, layout)?,
+    }
+    if let Some(image) = &loader {
+        cache.write_at(start + size, image)?;
+    }
     let dev = cache.into_inner()?;
-    Ok((Built { files, bytes: done, partition }, dev))
+    Ok((Built { files, bytes: done, partition, filesystem: plan.filesystem }, dev))
+}
+
+enum Volume {
+    Fat32(fat32::Layout),
+    Ntfs(ntfs::Layout),
+}
+
+impl Volume {
+    fn data_offset(&self, index: usize) -> Option<u64> {
+        match self {
+            Volume::Fat32(l) => l.data_offset(index),
+            Volume::Ntfs(l) => l.data_offset(index),
+        }
+    }
 }
 
 /// Writes into the cache from a position onwards.
@@ -486,7 +634,31 @@ pub fn verify<D: Read + Write + Seek>(
 ) -> Result<(), Error> {
     let disk = disk / sector as u64 * sector as u64;
     let mut cache = Cache::new(dev, disk, sector)?;
-    let slice = Slice::new(&mut cache, built.partition.0, built.partition.1)?;
+    let mut slice = Slice::new(&mut cache, built.partition.0, built.partition.1)?;
+    if built.filesystem == FileSystem::Ntfs {
+        let reader = ntfs::Reader::new(&mut slice)?;
+        let mut done = 0;
+        for (path, size, expected) in &built.files {
+            let mut hasher = Sha256::new();
+            let base = done;
+            let mut seen = 0u64;
+            let len = reader.read(&mut slice, path, &mut |bytes| {
+                if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                    return Err(Error::Cancelled);
+                }
+                hasher.update(bytes);
+                seen += bytes.len() as u64;
+                progress(Step::Verifying, base + seen.min(*size), built.bytes);
+                Ok(())
+            })?;
+            let actual: Sha256Digest = hasher.finalize().into();
+            if actual != *expected || len != *size {
+                return Err(Error::FileMismatch { path: path.clone(), expected: to_hex(expected), actual: to_hex(&actual) });
+            }
+            done += size;
+        }
+        return Ok(());
+    }
     let fs = fatfs::FileSystem::new(slice, fatfs::FsOptions::new())
         .map_err(|e| io::Error::new(e.kind(), format!("reading the new FAT32 back: {e}")))?;
     let root = fs.root_dir();

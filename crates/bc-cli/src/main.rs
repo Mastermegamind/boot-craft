@@ -118,6 +118,20 @@ struct WindowsArgs {
     /// Where to split an install.wim over 4 GiB (needs that much free space)
     #[arg(long, value_name = "DIR")]
     temp_dir: Option<PathBuf>,
+    /// File system: auto (FAT32 unless a file over 4 GiB can't be split), fat32 or ntfs
+    #[arg(long, value_enum, default_value_t = FsArg::Auto)]
+    filesystem: FsArg,
+    /// Rufus's UEFI:NTFS partition image, which NTFS drives boot through (default: uefi-ntfs.img beside boot-craft)
+    #[arg(long, value_name = "FILE")]
+    uefi_ntfs: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+enum FsArg {
+    #[default]
+    Auto,
+    Fat32,
+    Ntfs,
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
@@ -140,12 +154,28 @@ impl WindowsArgs {
             SchemeArg::Gpt => Scheme::Gpt,
             SchemeArg::Mbr => Scheme::Mbr,
         };
-        winusb::Options { scheme, unattend, temp_dir: self.temp_dir.clone(), ..winusb::Options::default() }
+        let filesystem = match self.filesystem {
+            FsArg::Auto => winusb::FileSystem::Auto,
+            FsArg::Fat32 => winusb::FileSystem::Fat32,
+            FsArg::Ntfs => winusb::FileSystem::Ntfs,
+        };
+        winusb::Options {
+            scheme,
+            unattend,
+            temp_dir: self.temp_dir.clone(),
+            filesystem,
+            uefi_ntfs: self.uefi_ntfs.clone(),
+            ..winusb::Options::default()
+        }
     }
 
     /// Whether any option that only Windows images use was given.
     fn any(&self) -> bool {
-        self.options().unattend.any() || self.scheme != SchemeArg::Gpt || self.temp_dir.is_some()
+        self.options().unattend.any()
+            || self.scheme != SchemeArg::Gpt
+            || self.temp_dir.is_some()
+            || self.filesystem != FsArg::Auto
+            || self.uefi_ntfs.is_some()
     }
 }
 

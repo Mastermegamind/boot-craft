@@ -416,7 +416,7 @@ impl<D: Drives> Server<D> {
                 "Prepare to write an image",
                 "Checks that `image` can be written to `drive` (it can be made bootable, its SHA-256 matches if given, the \
                  drive may be erased and is big enough) without changing anything. Hybrid ISOs and disk images are written \
-                 raw; Windows ISOs become a FAT32 install drive for UEFI (scheme mbr: BIOS too), optionally with Windows 11 setup options. Returns what will be erased and a one-time \
+                 raw; Windows ISOs become a FAT32 (or NTFS) install drive for UEFI (FAT32 with scheme mbr: BIOS too), optionally with Windows 11 setup options. Returns what will be erased and a one-time \
                  token for confirm_write. Show the summary to the person before confirming.",
                 json!({
                     "type": "object",
@@ -432,6 +432,7 @@ impl<D: Drives> Server<D> {
                         "skip_privacy": { "type": "boolean", "description": "Windows: answer the privacy questions with no" },
                         "locale": { "type": "string", "description": "Windows: language and region, e.g. en-US" },
                         "no_bitlocker": { "type": "boolean", "description": "Windows: don't turn on BitLocker device encryption automatically" },
+                        "filesystem": { "type": "string", "enum": ["auto", "fat32", "ntfs"], "description": "Windows images: auto (default: FAT32 unless a file over 4 GiB can't be split), fat32, or ntfs (UEFI only, through Rufus's UEFI:NTFS loader, which must be installed beside boot-craft)" },
                     },
                     "required": ["image", "drive"],
                     "additionalProperties": false,
@@ -679,6 +680,7 @@ impl<D: Drives> Server<D> {
                 "bytes": p.bytes,
                 "splits_install_wim": p.split.is_some(),
                 "starts_on": p.starts_on(),
+                "filesystem": if p.filesystem == winusb::FileSystem::Ntfs { "ntfs" } else { "fat32" },
                 "bios_boot": p.bios(),
                 "setup_options": p.unattend_options,
             })),
@@ -922,11 +924,23 @@ fn windows_options(args: &Value) -> Result<Option<winusb::Options>, String> {
         locale: text("locale"),
         no_bitlocker: flag("no_bitlocker"),
     };
-    if scheme.is_none() && !unattend.any() {
+    let filesystem = match args.get("filesystem").and_then(Value::as_str) {
+        None => None,
+        Some("auto") => Some(winusb::FileSystem::Auto),
+        Some("fat32") => Some(winusb::FileSystem::Fat32),
+        Some("ntfs") => Some(winusb::FileSystem::Ntfs),
+        Some(other) => return Err(format!("filesystem is auto, fat32 or ntfs, not {other}")),
+    };
+    if scheme.is_none() && !unattend.any() && filesystem.is_none() {
         return Ok(None);
     }
     unattend.check()?;
-    Ok(Some(winusb::Options { scheme: scheme.unwrap_or(Scheme::Gpt), unattend, ..winusb::Options::default() }))
+    Ok(Some(winusb::Options {
+        scheme: scheme.unwrap_or(Scheme::Gpt),
+        unattend,
+        filesystem: filesystem.unwrap_or_default(),
+        ..winusb::Options::default()
+    }))
 }
 
 fn send<W: Write>(output: &mut W, message: &Value) -> io::Result<()> {

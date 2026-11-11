@@ -102,6 +102,48 @@ try {
     $drive = Compare-WithImage "--unmount"
     Pass "--unmount locks and dismounts the volume, then writes and verifies"
 
+    # An NTFS Windows install drive from the fixture ISO: Windows itself must
+    # mount it, find nothing wrong with chkdsk, and read every file as the ISO has it.
+    $iso = Join-Path $work 'windows.iso'
+    $in = [IO.File]::OpenRead((Resolve-Path 'crates\bc-core\tests\fixtures\windows.iso.gz'))
+    $unzip = New-Object IO.Compression.GZipStream($in, [IO.Compression.CompressionMode]::Decompress)
+    $outIso = [IO.File]::Create($iso)
+    $unzip.CopyTo($outIso); $outIso.Dispose(); $unzip.Dispose(); $in.Dispose()
+    $loader = Join-Path $work 'uefi-ntfs.img'
+    Invoke-WebRequest -UseBasicParsing -OutFile $loader 'https://raw.githubusercontent.com/pbatard/rufus/master/res/uefi/uefi-ntfs.img'
+    if ((Get-FileHash $loader -Algorithm SHA256).Hash -ne '72683FA1250EEEA772D3399277B434D4E55BA8DD0DC926E52D817E701FC2EB9E') { Fail "uefi-ntfs.img changed upstream" }
+    $number = [int]$drive.Substring(13)
+    Invoke-DiskPart @("select disk $number", "clean") | Out-Null
+    $r = Write-Image $iso $drive @('--filesystem', 'ntfs', '--uefi-ntfs', $loader)
+    if (-not $r.ok) { Write-Host $r.out; Fail "writing an NTFS Windows drive failed" }
+    Write-Host $r.out
+    Invoke-DiskPart @("rescan") | Out-Null
+    Start-Sleep -Seconds 3
+    $part = Get-Partition -DiskNumber $number | Where-Object { $_.PartitionNumber -eq 1 }
+    if (-not $part.DriveLetter -or $part.DriveLetter -eq [char]0) {
+        $part | Add-PartitionAccessPath -AssignDriveLetter
+        Start-Sleep -Seconds 2
+        $part = Get-Partition -DiskNumber $number | Where-Object { $_.PartitionNumber -eq 1 }
+    }
+    $letter = "$($part.DriveLetter):"
+    $vol = Get-Volume -DriveLetter $part.DriveLetter
+    if ($vol.FileSystem -ne 'NTFS') { Fail "Windows sees $($vol.FileSystem), not NTFS, on $letter" }
+    if ($vol.FileSystemLabel -ne 'CCCOMA_X64FRE_EN-US_DV9') { Fail "label: $($vol.FileSystemLabel)" }
+    $check = chkdsk.exe $letter | Out-String
+    $code = $LASTEXITCODE
+    Write-Host $check
+    if ($code -ne 0 -or $check -notmatch 'found no problems') { Fail "chkdsk found problems on the NTFS drive (exit code $code)" }
+    Pass "Windows mounts the NTFS drive and chkdsk finds no problems"
+
+    $mounted = Mount-DiskImage -ImagePath $iso -PassThru
+    try {
+        $isoRoot = "$(($mounted | Get-Volume).DriveLetter):\"
+        $want = Get-ChildItem -Recurse -File $isoRoot | ForEach-Object { "$($_.FullName.Substring($isoRoot.Length)) $((Get-FileHash $_.FullName).Hash)" } | Sort-Object
+        $got = Get-ChildItem -Recurse -File "$letter\" | ForEach-Object { "$($_.FullName.Substring(3)) $((Get-FileHash $_.FullName).Hash)" } | Sort-Object
+        if (Compare-Object $want $got) { Compare-Object $want $got | Out-String | Write-Host; Fail "Windows reads different files from the NTFS drive" }
+        Pass "Windows reads all $($got.Count) files on the NTFS drive as the ISO has them"
+    } finally { Dismount-DiskImage -ImagePath $iso | Out-Null }
+
     Write-Host "all Windows tests passed"
 } finally {
     try { Invoke-DiskPart @("select vdisk file=`"$vhd`"", "detach vdisk") | Out-Null } catch {}

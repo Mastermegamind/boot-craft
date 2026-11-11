@@ -121,9 +121,9 @@ jobs:
         with:
           toolchain: "1.85"
       - uses: Swatinem/rust-cache@v2
-      - run: sudo apt-get update && sudo apt-get install -y nasm genisoimage wimtools grub-efi-amd64-bin dosfstools qemu-system-x86 ovmf
-      # The unit tests that need wimlib, genisoimage, fsck.fat and nasm, now that they're installed.
-      - run: PATH=$PATH:/usr/sbin cargo test --locked -p bc-core -- winusb fat32
+      - run: sudo apt-get update && sudo apt-get install -y nasm genisoimage wimtools grub-efi-amd64-bin dosfstools ntfs-3g qemu-system-x86 ovmf
+      # The unit tests that need wimlib, genisoimage, fsck.fat, nasm and ntfs-3g, now that they're installed.
+      - run: PATH=$PATH:/usr/sbin cargo test --locked -p bc-core -- winusb fat32 ntfs
       - run: cargo build --locked
       # The runner's /mnt has room for the 4 GiB+ install.wim test.
       - run: sudo mkdir -p /mnt/work && sudo env BIG=1 WORK_ROOT=/mnt/work scripts/windows-usb-test.sh
