@@ -126,24 +126,26 @@ impl Drive {
         if parts.is_empty() { "unknown model".into() } else { parts.join(" ") }
     }
 
-    /// Whether this drive may be erased. The checks run most serious first, so
-    /// the reason given is the one that matters.
+    /// Whether this drive may be erased. The checks run most fundamental
+    /// first, so the reason given is the one that matters: an internal disk
+    /// is refused as internal, not as "mounted", since unmounting it wouldn't help.
     pub fn check(&self, policy: &Policy) -> Result<(), Refusal> {
         if let Some(usage) = self.usage.iter().find(|u| u.system) {
             return Err(Refusal::SystemDisk(usage.clone()));
         }
-        let unmountable = |u: &&Usage| policy.unmount && matches!(u.kind, UsageKind::Mounted(_));
-        if let Some(usage) = self.usage.iter().find(|u| !unmountable(u)) {
-            return Err(Refusal::InUse(usage.clone()));
+        match self.transport {
+            Transport::Usb | Transport::External | Transport::Sd => {}
+            Transport::Virtual if policy.allow_loop => {}
+            Transport::Virtual => return Err(Refusal::Virtual),
+            Transport::Internal => return Err(Refusal::Internal),
         }
         if self.read_only {
             return Err(Refusal::ReadOnly);
         }
-        match self.transport {
-            Transport::Usb | Transport::External | Transport::Sd => Ok(()),
-            Transport::Virtual if policy.allow_loop => Ok(()),
-            Transport::Virtual => Err(Refusal::Virtual),
-            Transport::Internal => Err(Refusal::Internal),
+        let unmountable = |u: &&Usage| policy.unmount && matches!(u.kind, UsageKind::Mounted(_));
+        match self.usage.iter().find(|u| !unmountable(u)) {
+            Some(usage) => Err(Refusal::InUse(usage.clone())),
+            None => Ok(()),
         }
     }
 
@@ -215,6 +217,13 @@ mod tests {
         let held = Usage { part: "sdb1".into(), kind: UsageKind::Held(vec!["dm-0".into()]), system: false };
         let luks_stick = Drive { usage: vec![held.clone()], ..stick() };
         assert_eq!(luks_stick.check(&unmount), Err(Refusal::InUse(held)));
+    }
+
+    #[test]
+    fn an_internal_disk_is_refused_as_internal_even_when_mounted() {
+        let disk = Drive { transport: Transport::Internal, usage: vec![mounted("sda1", "/data", false)], ..stick() };
+        assert_eq!(disk.check(&Policy::default()), Err(Refusal::Internal));
+        assert_eq!(disk.check(&Policy { unmount: true, ..Policy::default() }), Err(Refusal::Internal));
     }
 
     #[test]

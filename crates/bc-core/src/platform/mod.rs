@@ -39,6 +39,10 @@ pub fn find_drive(name: &str) -> io::Result<Option<Drive>> {
     imp::find_drive(name)
 }
 
+/// Whether volumes stay mounted until [`open_exclusive`], which then locks
+/// and dismounts them (Windows), rather than going away in [`unmount`].
+pub const UNMOUNTS_ON_OPEN: bool = cfg!(windows);
+
 /// Unmounts every volume on `drive`. Callers check first that none of them
 /// is the system's: see [`crate::write::Target::open`].
 pub fn unmount(drive: &Drive) -> Result<(), Error> {

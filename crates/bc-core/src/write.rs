@@ -47,15 +47,18 @@ impl Target {
     /// Looks `listed` up again (so a stick swapped since it was listed isn't
     /// written), checks it against `policy`, and opens it exclusively.
     /// With `policy.unmount`, its volumes are unmounted first, and then it is
-    /// looked up and checked again with nothing mounted.
+    /// looked up and checked again with nothing mounted (on Windows, the volumes
+    /// are locked and dismounted as the drive is opened instead).
     pub fn open(listed: &Drive, policy: &Policy) -> Result<Self, Error> {
         let mut drive = fresh(listed)?;
         drive.check(policy).map_err(|reason| Error::Refused { drive: drive.name.clone(), reason })?;
         if policy.unmount && drive.mounted() {
             platform::unmount(&drive)?;
             drive = fresh(listed)?;
-            let strict = Policy { unmount: false, ..*policy };
-            drive.check(&strict).map_err(|reason| Error::Refused { drive: drive.name.clone(), reason })?;
+            // Where unmounting really happens when the drive is opened, its
+            // volumes still show here; the lock at open time is the check.
+            let after = if platform::UNMOUNTS_ON_OPEN { *policy } else { Policy { unmount: false, ..*policy } };
+            drive.check(&after).map_err(|reason| Error::Refused { drive: drive.name.clone(), reason })?;
         }
         let raw = platform::open_exclusive(&drive)?;
         Ok(Self { drive, raw, cancel: None })
