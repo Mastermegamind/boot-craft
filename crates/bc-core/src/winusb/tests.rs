@@ -138,7 +138,7 @@ fn refusals_come_before_anything_is_touched() {
     let dir = tempfile::tempdir().unwrap();
     let path = iso_file(&dir, "windows.iso.gz");
     // A file other than install.wim over the limit: needs NTFS.
-    let tiny = Options { split_over: 100, ..Options::default() };
+    let tiny = Options { split_over: 1 << 20, ..Options::default() }; // only setup.dll (3 MiB) is over
     let err = planned(&path, &tiny).unwrap_err().to_string();
     assert!(err.contains("NTFS"), "{err}");
     // Not Windows.

@@ -103,8 +103,9 @@ impl<D: Read + Write + Seek> Cache<D> {
     }
 
     /// Reads sectors `first..end` of a block from the drive where it doesn't
-    /// hold them yet, in as few reads as possible.
-    fn fill(&mut self, index: u64, first: usize, end: usize) -> io::Result<()> {
+    /// hold them yet, in as few reads as possible; with `readahead`, on to the
+    /// end of the block too, as far as nothing there is held already.
+    fn fill(&mut self, index: u64, first: usize, end: usize, readahead: bool) -> io::Result<()> {
         let sector = self.sector as usize;
         let block = self.block(index)?;
         let mut s = first;
@@ -117,6 +118,13 @@ impl<D: Read + Write + Seek> Cache<D> {
             let start = s;
             while s < end && !block.valid[s] {
                 s += 1;
+            }
+            // Reading on: the sectors after a read are wanted next, and
+            // drives are far faster at one big read than many small ones.
+            if readahead && s == end {
+                while s < block.valid.len() && !block.valid[s] {
+                    s += 1;
+                }
             }
             runs.push((start, s));
         }
@@ -157,7 +165,7 @@ impl<D: Read + Write + Seek> Cache<D> {
             let (index, within) = (at / BLOCK, (at % BLOCK) as usize);
             let n = ((end - at) as usize).min(self.block_len(index) - within);
             let sector = self.sector as usize;
-            self.fill(index, within / sector, (within + n).div_ceil(sector))?;
+            self.fill(index, within / sector, (within + n).div_ceil(sector), true)?;
             let block = self.block(index)?;
             let out = (at - offset) as usize;
             buf[out..out + n].copy_from_slice(&block.data[within..within + n]);
@@ -179,10 +187,10 @@ impl<D: Read + Write + Seek> Cache<D> {
             // Sectors only partly overwritten need their other bytes first.
             let (first, last) = (within / sector, (within + n - 1) / sector);
             if within % sector != 0 {
-                self.fill(index, first, first + 1)?;
+                self.fill(index, first, first + 1, false)?;
             }
             if (within + n) % sector != 0 {
-                self.fill(index, last, last + 1)?;
+                self.fill(index, last, last + 1, false)?;
             }
             let block = self.block(index)?;
             let from = (at - offset) as usize;
@@ -361,6 +369,24 @@ mod tests {
         let dev = cache.into_inner().unwrap();
         assert_eq!(dev.reads, 0);
         assert_eq!(dev.writes, 2, "one write per changed run in each block");
+    }
+
+    #[test]
+    fn small_reads_read_ahead_to_the_end_of_the_block() {
+        let size = 2 * BLOCK as usize;
+        let expected = strict(size, 512).data.into_inner();
+        let mut cache = Cache::new(strict(size, 512), size as u64, 512).unwrap();
+        cache.write_at(BLOCK / 2, &[1; 512]).unwrap(); // held, so not read over
+        let mut piece = [0u8; 4096];
+        let mut back = Vec::new();
+        for at in (0..BLOCK).step_by(4096) {
+            cache.read_at(at, &mut piece).unwrap();
+            back.extend_from_slice(&piece);
+        }
+        assert_eq!(back[..BLOCK as usize / 2], expected[..BLOCK as usize / 2]);
+        assert_eq!(back[BLOCK as usize / 2..BLOCK as usize / 2 + 512], [1; 512]);
+        assert_eq!(back[BLOCK as usize / 2 + 512..], expected[BLOCK as usize / 2 + 512..BLOCK as usize]);
+        assert_eq!(cache.get_mut().reads, 2, "one read up to the held sector, one after it");
     }
 
     #[test]
