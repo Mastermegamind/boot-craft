@@ -1,0 +1,13 @@
+[package]
+name = "rr-mcp"
+description = "MCP server that lets AI agents use rust-rufus"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rr-core = { path = "../rr-core" }
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
