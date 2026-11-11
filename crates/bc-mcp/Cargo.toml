@@ -4,6 +4,8 @@ description = "MCP server that lets AI agents use boot-craft"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 bc-core = { path = "../bc-core" }

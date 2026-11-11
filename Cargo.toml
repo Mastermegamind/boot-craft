@@ -6,6 +6,8 @@ members = ["crates/bc-core", "crates/bc-cli", "crates/bc-mcp"]
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
+license = "Unlicense OR MIT-0"
+repository = "https://github.com/Mastermegamind/boot-craft"
 
 [workspace.dependencies]
 clap = { version = "4.5", features = ["derive"] }

@@ -183,9 +183,11 @@ Rules:
 
 ## Open decisions
 
-- **License**: all code is ours, so any license works (MIT/Apache-2.0 or
-  GPL-3.0). Bundling wimlib or ntfs-3g as separate programs is fine either
-  way; linking them into the binary would require GPL.
+- ~~**License**~~ decided: `Unlicense OR MIT-0`, no conditions for anyone.
+  To keep it that way, GPL code (wimlib, ntfs-3g) is never linked into
+  boot-craft: it runs as separate programs. When release packages bundle
+  those programs, they ship with their own licenses and source offers;
+  boot-craft's own code stays unconditional.
 - **macOS privileges**: `authopen` (simple, per-write password) vs an
   SMAppService privileged helper (one-time approval, needs signing).
 - **Final name** (see GOAL.md).

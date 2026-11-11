@@ -4,6 +4,8 @@ description = "Drive discovery, safety rules, image inspection and writing for b
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 sha2.workspace = true

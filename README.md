@@ -112,4 +112,10 @@ sudo scripts/loop-test.sh
 
 ## License
 
-Not decided yet (see PLAN.md, "Open decisions").
+Free for anyone, for anything, with no conditions: boot-craft is released
+into the public domain under the [Unlicense](UNLICENSE), or, where public
+domain isn't recognised, under [MIT-0](LICENSE-MIT-0) (MIT with no
+attribution required). Use it, copy it, change it, sell it, relicense it,
+ship it in closed products; no credit needed.
+
+Contributions are accepted under the same terms.
