@@ -4,8 +4,9 @@ Make bootable USB drives from **Windows, Linux, macOS and other** OS images,
 on **Windows, macOS and Linux**. Written from scratch in Rust; inspired by
 what [Rufus](https://rufus.ie) does on Windows, sharing none of its code.
 
-> **Status: early scaffold.** The Linux raw writer is being built first;
-> macOS and Windows backends and the other image types come next. See
+> **Status: early.** Raw writing with verification works on Linux, macOS
+> and Windows, for plain and compressed images; Windows-ISO support and the
+> other image types come next. See
 > [PLAN.md](PLAN.md) for the roadmap and [GOAL.md](GOAL.md) for what we're
 > building and why.
 
@@ -15,9 +16,9 @@ The tool looks inside the image to work out what it is and how to write it.
 
 | Image | Examples | Mode | Status |
 |---|---|---|---|
-| Linux hybrid ISOs | Ubuntu, Fedora, Debian, Mint, Arch, Kali, Parrot, Tails | raw write + verify | done (Linux) |
-| BSD, ChromeOS Flex, ARM boards | FreeBSD memstick, ChromeOS Flex `.bin`, Raspberry Pi OS `.img` | raw write + verify | done (Linux) |
-| Compressed images | `.xz`, `.gz`, `.zst`, `.bz2`, `.zip`, fixed `.vhd` | decompressed while writing | done (Linux) |
+| Linux hybrid ISOs | Ubuntu, Fedora, Debian, Mint, Arch, Kali, Parrot, Tails | raw write + verify | done |
+| BSD, ChromeOS Flex, ARM boards | FreeBSD memstick, ChromeOS Flex `.bin`, Raspberry Pi OS `.img` | raw write + verify | done |
+| Compressed images | `.xz`, `.gz`, `.zst`, `.bz2`, `.zip`, fixed `.vhd` | decompressed while writing | done |
 | Windows install ISOs | Windows 10 / 11, Server | file copy, FAT32 or NTFS, Windows 11 options | planned (M3) |
 | Windows PE ISOs | Hiren's BootCD PE | file copy | planned (M3) |
 | Non-hybrid Linux / rescue ISOs | older distros | file copy + GRUB / Syslinux | planned (M4) |
@@ -28,8 +29,8 @@ The tool looks inside the image to work out what it is and how to write it.
 
 | | Linux | macOS | Windows |
 |---|---|---|---|
-| List safe drives | done | planned (M1) | planned (M1) |
-| Raw write + verify | done | planned (M1) | planned (M1) |
+| List safe drives | done | done | done |
+| Raw write + verify | done | done | done |
 | Recognise every image type | planned (M2) | planned (M2) | planned (M2) |
 | Windows install USB + Windows 11 options | planned (M3) | planned (M3) | planned (M3) |
 | Other ISOs, macOS media, FreeDOS | planned (M4) | planned (M4) | planned (M4) |
@@ -43,7 +44,12 @@ boot-craft info ubuntu.iso              # what the image is; will a raw write bo
 boot-craft hash ubuntu.iso              # SHA-256
 sudo boot-craft write ubuntu.iso sdb    # erase sdb and write the image, then verify
 sudo boot-craft write ubuntu.iso sdb --sha256 <expected>   # check the image first
+sudo boot-craft write raspios.img.xz sdb --unmount          # compressed; unmount sdb's volumes first
+boot-craft list --watch                                     # follow drives as they come and go
 ```
+
+Drive names follow each OS: `sdb` on Linux, `disk4` on macOS (run with
+`sudo`), `PhysicalDrive2` on Windows (run from an administrator prompt).
 
 `write` asks you to type the drive's name before erasing it (`--yes` skips
 that for scripts). It reads the drive back afterwards and compares hashes

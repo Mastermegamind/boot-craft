@@ -100,13 +100,18 @@ Rules:
 
 ## M1: Raw writer on all three platforms
 
-- [ ] macOS backend: list via `diskutil -plist`, system disk via APFS physical
-      store, `unmountDisk`, write `/dev/rdiskN`, `authopen` for privileges
-- [ ] Windows backend: SetupAPI listing, lock + dismount volumes, write
-      `\\.\PhysicalDriveN` with aligned unbuffered I/O, UAC manifest
-- [ ] End-to-end tests on virtual disks: loop (Linux), `hdiutil attach -nomount`
-      (macOS), `diskpart`-created VHD (Windows), run in CI
-- [ ] `--unmount` instead of refusing mounted drives
+- [x] macOS backend: `diskutil list/info -plist` (parsed in pure Rust, tested
+      on every OS), boot disk found through APFS physical stores,
+      `diskutil unmountDisk`, raw `/dev/rdiskN` with whole-sector I/O; runs
+      under `sudo` for now (`authopen` / a privileged helper come with the GUI)
+- [x] Windows backend: `\\.\PhysicalDriveN` via storage and disk IOCTLs
+      (bus type, size, sector size, write protection, partitions), volumes
+      matched to disks by their extents, the Windows volume marking the system
+      disk; every volume locked and dismounted for the whole write; kernel32
+      called directly; run from an administrator prompt (UAC manifest in M6)
+- [x] End-to-end tests on virtual disks in CI: loop devices (Linux), RAM disks
+      from `hdiutil` (macOS), attached fixed VHDs (Windows)
+- [x] `--unmount` instead of refusing mounted drives (never the system's)
 - [x] Ctrl-C: stop cleanly and say the drive is now unusable until rewritten
 - [x] Compressed images: `.xz`, `.gz`, `.zst`, `.bz2`, `.zip`, written while
       decompressing (pure-Rust decoders, so nothing to install on any OS);
@@ -114,9 +119,14 @@ Rules:
 - [x] Fixed-size `.vhd` (strip the footer) alongside `.img` / `.raw` / `.dd`
 - [x] Pick up `SHA256SUMS`, `<image>.sha256` or Fedora's `*-CHECKSUM` next to the
       image automatically (integrity, not authenticity)
-- [ ] Hot-plug: lists update when a stick is plugged in
-- [ ] Tested raw images: Ubuntu, Fedora, Debian, Arch, Kali, Tails, FreeBSD /
-      OpenBSD memstick, ChromeOS Flex, Raspberry Pi OS
+- [x] Hot-plug: `list --watch` lists again whenever a drive comes, goes or
+      changes
+- [x] Boot test in CI (`scripts/boot-test.sh`): the current Alpine ISO, checked
+      against Alpine's published SHA-256, written to a loop device, verified,
+      then booted in QEMU from legacy BIOS and from UEFI to the login prompt
+- [ ] More real images through the same test: Ubuntu, Fedora, Debian, Arch,
+      Kali, Tails, FreeBSD / OpenBSD memstick, ChromeOS Flex, Raspberry Pi OS
+      (big downloads: a weekly job rather than every push)
 
 ## M2: Recognise every image
 

@@ -99,3 +99,16 @@ jobs:
       - run: ./scripts/windows-test.ps1
         shell: pwsh
 
+  # A written drive really boots: Alpine, from BIOS and UEFI, in QEMU.
+  boot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.85"
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y qemu-system-x86 ovmf
+      - run: cargo build --locked
+      - run: sudo scripts/boot-test.sh
+
