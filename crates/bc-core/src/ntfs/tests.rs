@@ -168,3 +168,30 @@ fn the_ntfs_crate_reads_back_every_file() {
         assert!(reader.read(&mut image, "sources/nothing", &mut |_| Ok(())).is_err());
     }
 }
+
+#[test]
+fn sdh_entries_are_laid_out_as_windows_checks() {
+    let (_, sii, sdh) = security();
+    // Three descriptors; $SDH: 8-byte key, 20 bytes of data, "II" in the padding.
+    assert_eq!((sii.len(), sdh.len()), (3 * 0x28, 3 * 0x30));
+    for e in sdh.chunks(0x30) {
+        assert_eq!(&e[0..4], &[0x18, 0, 0x14, 0], "data at 0x18, 20 bytes");
+        assert_eq!(&e[8..12], &[0x30, 0, 8, 0]);
+        assert_eq!(&e[0x2C..0x30], b"I\0I\0");
+    }
+    for e in sii.chunks(0x28) {
+        assert_eq!(&e[0..4], &[0x14, 0, 0x14, 0]);
+    }
+}
+
+#[test]
+fn attrdef_is_as_mkntfs_writes_it() {
+    let (Some(mkntfs), Some(cat)) = (tool("mkntfs"), tool("ntfscat")) else { return };
+    let dir = tempfile::tempdir().unwrap();
+    let img = dir.path().join("ref.img");
+    std::fs::write(&img, vec![0u8; 16 << 20]).unwrap();
+    let (ok, text) = run(&mkntfs, &["-q", "-F", "-f", img.to_str().unwrap()]);
+    assert!(ok, "{text}");
+    let out = Command::new(cat).arg("-f").arg(&img).arg("$AttrDef").output().unwrap();
+    assert!(out.stdout == attrdef(), "differs from mkntfs's $AttrDef");
+}

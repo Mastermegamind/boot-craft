@@ -752,7 +752,7 @@ fn file_name_len(chars: usize) -> usize {
 /// A record number as a file reference (sequence number in the top 16 bits).
 fn reference(record: u64) -> u64 {
     let sequence = if record == 0 || record >= FIRST_FREE_RECORD - 3 { 1 } else { record };
-    record | sequence << 48
+    record | (sequence << 48)
 }
 
 /// Seconds since 1970 as NTFS time: 100 ns units since 1601.
@@ -1070,7 +1070,7 @@ fn runlist(runs: &[(Option<u64>, u64)]) -> Vec<u8> {
             }
             None => (0, 0),
         };
-        out.push((delta_bytes << 4 | len_bytes) as u8);
+        out.push(((delta_bytes << 4) | len_bytes) as u8);
         out.extend_from_slice(&len.to_le_bytes()[..len_bytes]);
         out.extend_from_slice(&delta.to_le_bytes()[..delta_bytes]);
     }
@@ -1259,7 +1259,11 @@ fn security() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
         sii.extend(view_entry(&id.to_le_bytes(), &header));
         let mut key = hash.to_le_bytes().to_vec();
         key.extend_from_slice(&id.to_le_bytes());
-        sdh.push((hash, *id, view_entry(&key, &[header.as_slice(), &[b'I', 0, b'I', 0]].concat())));
+        // The entry's data is the header; "II" fills the padding after it.
+        let mut entry = view_entry(&key, &header);
+        let end = entry.len();
+        entry[end - 4..].copy_from_slice(&[b'I', 0, b'I', 0]);
+        sdh.push((hash, *id, entry));
     }
     // The stream ends where the last copy does, not at its padding.
     let mut stream = sds.clone();
@@ -1293,7 +1297,7 @@ fn quotas(stamp: u64) -> (Vec<u8>, Vec<u8>) {
 const ATTRDEF: [(&str, u32, u32, u32, u64, i64); 16] = [
     ("$STANDARD_INFORMATION", 0x10, 0, 0x40, 0x30, 0x48),
     ("$ATTRIBUTE_LIST", 0x20, 0, 0x80, 0, -1),
-    ("$FILE_NAME", 0x30, 1, 0x42, 0x44, 0x242),
+    ("$FILE_NAME", 0x30, 0, 0x42, 0x44, 0x242),
     ("$OBJECT_ID", 0x40, 0, 0x40, 0, 0x100),
     ("$SECURITY_DESCRIPTOR", 0x50, 0, 0x80, 0, -1),
     ("$VOLUME_NAME", 0x60, 0, 0x40, 2, 0x100),
