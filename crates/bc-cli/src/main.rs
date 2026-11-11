@@ -6,11 +6,11 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use clap::{Args, Parser, Subcommand};
 use bc_core::hash::{self, Sha256Digest, to_hex};
 use bc_core::image;
 use bc_core::write::{self, Target};
 use bc_core::{Drive, Policy, platform};
+use clap::{Args, Parser, Subcommand};
 
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
 
