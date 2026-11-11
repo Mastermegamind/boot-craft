@@ -31,10 +31,10 @@ jobs:
       - run: cargo build --locked --release
       - uses: actions/upload-artifact@v4
         with:
-          name: rust-rufus-${{ runner.os }}
+          name: boot-craft-${{ runner.os }}
           path: |
-            target/release/rust-rufus
-            target/release/rust-rufus.exe
+            target/release/boot-craft
+            target/release/boot-craft.exe
           if-no-files-found: error
 
   # Intel Macs: compile only (the runners are Apple Silicon).

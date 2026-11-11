@@ -1,12 +1,12 @@
 [package]
-name = "rr-mcp"
-description = "MCP server that lets AI agents use rust-rufus"
+name = "bc-mcp"
+description = "MCP server that lets AI agents use boot-craft"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-rr-core = { path = "../rr-core" }
+bc-core = { path = "../bc-core" }
 serde_json.workspace = true
 
 [dev-dependencies]

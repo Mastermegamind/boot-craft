@@ -1,6 +1,6 @@
 use std::io::Cursor;
 
-use rr_core::Transport;
+use bc_core::Transport;
 
 use super::*;
 
@@ -185,7 +185,7 @@ fn the_handshake_agrees_on_a_protocol_version() {
         json!({ "protocolVersion": "2025-03-26", "capabilities": {}, "clientInfo": { "name": "t", "version": "1" } }),
     );
     assert_eq!(reply["result"]["protocolVersion"], "2025-03-26");
-    assert_eq!(reply["result"]["serverInfo"]["name"], "rust-rufus");
+    assert_eq!(reply["result"]["serverInfo"]["name"], "boot-craft");
     assert!(reply["result"]["capabilities"]["tools"].is_object());
     let reply = h.request("initialize", json!({ "protocolVersion": "1999-01-01" }));
     assert_eq!(reply["result"]["protocolVersion"], PROTOCOL_VERSIONS[0]);

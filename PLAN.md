@@ -7,9 +7,9 @@ macOS, VHDs on Windows), never against a real drive.
 ## Architecture
 
 ```
-rust-rufus/
+boot-craft/
 ├── crates/
-│   ├── rr-core/              platform-independent logic
+│   ├── bc-core/              platform-independent logic
 │   │   ├── image             what an image is (Windows, Linux, macOS, BSD...), which mode
 │   │   ├── iso               ISO 9660 / Joliet / UDF directory reading
 │   │   ├── modes/            raw, windows, grub-syslinux, macos, freedos
@@ -20,9 +20,9 @@ rust-rufus/
 │   │       ├── linux         sysfs, /proc/self/mountinfo, O_EXCL, BLKRRPART
 │   │       ├── macos         diskutil/DiskArbitration, /dev/rdiskN, authopen
 │   │       └── windows       SetupAPI, IOCTL_STORAGE_*, FSCTL_LOCK_VOLUME
-│   ├── rr-cli/               `rust-rufus` command line
-│   ├── rr-mcp/               MCP server for AI agents (`rust-rufus mcp`)
-│   └── rr-gui/               egui desktop app (M5)
+│   ├── bc-cli/               `boot-craft` command line
+│   ├── bc-mcp/               MCP server for AI agents (`boot-craft mcp`)
+│   └── bc-gui/               egui desktop app (M5)
 └── scripts/                  virtual-disk end-to-end tests per OS
 ```
 
@@ -40,7 +40,7 @@ Every platform backend provides the same small interface:
 
 ## M0: Scaffold
 
-- [x] Cargo workspace: `rr-core`, `rr-cli` (`rust-rufus` binary)
+- [x] Cargo workspace: `bc-core`, `bc-cli` (`boot-craft` binary)
 - [x] `platform` module with the interface above; **Linux** backend implemented,
       macOS and Windows stubs that compile and say "not supported yet"
 - [x] Linux drive discovery: size, vendor/model, USB / SD / internal / loop,
@@ -58,9 +58,9 @@ Every platform backend provides the same small interface:
 ## MCP: agent access (alongside M0–M1, then grows with each milestone)
 
 An MCP server over stdio (JSON-RPC 2.0, the MCP 2025-06-18 protocol), started
-with `rust-rufus mcp`. An MCP client launches it the same way it launches any
+with `boot-craft mcp`. An MCP client launches it the same way it launches any
 local server, e.g. for Claude Code:
-`claude mcp add rust-rufus -- sudo rust-rufus mcp --allow-writes`.
+`claude mcp add boot-craft -- sudo boot-craft mcp --allow-writes`.
 
 | Tool | What it does | Needs `--allow-writes` |
 |---|---|---|

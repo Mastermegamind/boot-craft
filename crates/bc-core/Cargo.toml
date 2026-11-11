@@ -1,6 +1,6 @@
 [package]
-name = "rr-core"
-description = "Drive discovery, safety rules, image inspection and writing for rust-rufus"
+name = "bc-core"
+description = "Drive discovery, safety rules, image inspection and writing for boot-craft"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

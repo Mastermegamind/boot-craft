@@ -1,4 +1,4 @@
-//! `rust-rufus`: the command line over rr-core.
+//! `boot-craft`: the command line over bc-core.
 
 use std::fs::File;
 use std::io::{self, BufRead, IsTerminal, Write};
@@ -7,15 +7,15 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use clap::{Args, Parser, Subcommand};
-use rr_core::hash::{self, Sha256Digest, to_hex};
-use rr_core::image;
-use rr_core::write::{self, Target};
-use rr_core::{Drive, Policy, platform};
+use bc_core::hash::{self, Sha256Digest, to_hex};
+use bc_core::image;
+use bc_core::write::{self, Target};
+use bc_core::{Drive, Policy, platform};
 
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 #[derive(Parser)]
-#[command(name = "rust-rufus", version, about = "Make bootable USB drives from ISO and disk images")]
+#[command(name = "boot-craft", version, about = "Make bootable USB drives from ISO and disk images")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -89,8 +89,8 @@ fn run(cli: Cli) -> Result {
         }
         Command::Write(args) => write_image(&args),
         Command::Mcp { allow_writes, allow_loop } => {
-            let options = rr_mcp::Options { allow_writes, allow_loop, ..rr_mcp::Options::default() };
-            Ok(rr_mcp::serve(io::stdin().lock(), io::stdout().lock(), options)?)
+            let options = bc_mcp::Options { allow_writes, allow_loop, ..bc_mcp::Options::default() };
+            Ok(bc_mcp::serve(io::stdin().lock(), io::stdout().lock(), options)?)
         }
     }
 }
@@ -151,7 +151,7 @@ fn write_image(args: &WriteArgs) -> Result {
         }
         eprintln!("SHA-256 matches.");
     }
-    let drive = platform::find_drive(&args.drive)?.ok_or_else(|| format!("no drive named {}; see `rust-rufus list`", args.drive))?;
+    let drive = platform::find_drive(&args.drive)?.ok_or_else(|| format!("no drive named {}; see `boot-craft list`", args.drive))?;
     drive.check(&policy).map_err(|reason| format!("{} can't be written: {reason}", drive.name))?;
     write::fits(info.size, drive.size_bytes)?;
     confirm(&drive, &args.image, args.yes)?;

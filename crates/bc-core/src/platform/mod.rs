@@ -24,7 +24,7 @@ mod windows;
 use windows as imp;
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-compile_error!("rust-rufus runs on Linux, macOS and Windows");
+compile_error!("boot-craft runs on Linux, macOS and Windows");
 
 /// Every drive the OS reports, with the facts the safety rules need.
 pub fn list_drives() -> io::Result<Vec<Drive>> {

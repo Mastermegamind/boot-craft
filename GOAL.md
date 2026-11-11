@@ -75,7 +75,7 @@ file name.
   the OS cache, so the bytes really come from the drive.
 - **One core, thin platform layers.** All logic (images, partitioning,
   filesystems, safety rules, verification) lives in the platform-independent
-  `rr-core`. Each OS only supplies: list drives, unmount, open raw, reread
+  `bc-core`. Each OS only supplies: list drives, unmount, open raw, reread
   partitions, run elevated.
 - **Safe parsing.** ISO, UDF, WIM and partition tables come from downloaded
   files and are parsed with admin rights. That code is Rust, with `unsafe`
@@ -85,8 +85,8 @@ file name.
   it as a separate process and ship it with the app rather than reimplement it.
   Replace with Rust later only where it removes a real pain.
 - **Library first.** The CLI, the GUI and the MCP server are thin layers over
-  `rr-core`, so all three can do the same things.
-- **Usable by AI agents, safely.** A built-in MCP server (`rust-rufus mcp`)
+  `bc-core`, so all three can do the same things.
+- **Usable by AI agents, safely.** A built-in MCP server (`boot-craft mcp`)
   lets agents (Claude Code, Claude Desktop, any MCP client) list drives,
   inspect and hash images, and, only when the person allows it, write them.
   Agents get the same safety rules as people, and never more: writes are off
@@ -104,5 +104,6 @@ work.
 
 ## Name
 
-`rust-rufus` is a working name. "Rufus" belongs to its author, so the
-project needs its own name before any public release.
+The project is **boot-craft**: the repository, the `boot-craft` command and
+the `bc-*` crates. Rufus is named only as the reference for what the tool
+does; its name, logo and code are not used.

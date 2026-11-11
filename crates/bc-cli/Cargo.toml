@@ -1,15 +1,15 @@
 [package]
-name = "rr-cli"
-description = "The rust-rufus command line"
+name = "bc-cli"
+description = "The boot-craft command line"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
 [[bin]]
-name = "rust-rufus"
+name = "boot-craft"
 path = "src/main.rs"
 
 [dependencies]
 clap.workspace = true
-rr-core = { path = "../rr-core" }
-rr-mcp = { path = "../rr-mcp" }
+bc-core = { path = "../bc-core" }
+bc-mcp = { path = "../bc-mcp" }

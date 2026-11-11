@@ -1,4 +1,4 @@
-//! The core of rust-rufus: everything except the command line and the GUI.
+//! The core of boot-craft: everything except the command line and the GUI.
 //!
 //! The modules at the top level are platform-independent: what a drive is
 //! and whether it may be erased ([`drive`]), what an image is ([`image`]),

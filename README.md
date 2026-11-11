@@ -1,4 +1,4 @@
-# rust-rufus
+# boot-craft
 
 Make bootable USB drives from **Windows, Linux, macOS and other** OS images,
 on **Windows, macOS and Linux**. Written from scratch in Rust; inspired by
@@ -38,11 +38,11 @@ The tool looks inside the image to work out what it is and how to write it.
 ## Usage (CLI)
 
 ```sh
-rust-rufus list                         # drives, and whether each may be written
-rust-rufus info ubuntu.iso              # what the image is; will a raw write boot?
-rust-rufus hash ubuntu.iso              # SHA-256
-sudo rust-rufus write ubuntu.iso sdb    # erase sdb and write the image, then verify
-sudo rust-rufus write ubuntu.iso sdb --sha256 <expected>   # check the image first
+boot-craft list                         # drives, and whether each may be written
+boot-craft info ubuntu.iso              # what the image is; will a raw write boot?
+boot-craft hash ubuntu.iso              # SHA-256
+sudo boot-craft write ubuntu.iso sdb    # erase sdb and write the image, then verify
+sudo boot-craft write ubuntu.iso sdb --sha256 <expected>   # check the image first
 ```
 
 `write` asks you to type the drive's name before erasing it (`--yes` skips
@@ -51,16 +51,16 @@ that for scripts). It reads the drive back afterwards and compares hashes
 
 ## AI agents (MCP)
 
-`rust-rufus mcp` runs an [MCP](https://modelcontextprotocol.io) server on
+`boot-craft mcp` runs an [MCP](https://modelcontextprotocol.io) server on
 stdio, so agents such as Claude Code or Claude Desktop can use the tool:
 
 ```sh
 # read-only: list drives, inspect and hash images
-claude mcp add rust-rufus -- rust-rufus mcp
+claude mcp add boot-craft -- boot-craft mcp
 
 # also allow writing: prepare, confirm with a one-time token, then follow
 # the background write with write_status
-claude mcp add rust-rufus -- sudo rust-rufus mcp --allow-writes
+claude mcp add boot-craft -- sudo boot-craft mcp --allow-writes
 ```
 
 Agents get exactly the safety rules people get, never more. See PLAN.md,
@@ -89,7 +89,7 @@ same rules, and each rule has a test:
 Needs Rust 1.85 or newer.
 
 ```sh
-cargo build --release          # target/release/rust-rufus
+cargo build --release          # target/release/boot-craft
 cargo test                     # unit tests (no root, touches no drive)
 ```
 
@@ -104,10 +104,10 @@ sudo scripts/loop-test.sh
 
 | Path | What |
 |---|---|
-| `crates/rr-core` | All logic: images, safety policy, writing, verifying, hashing |
-| `crates/rr-core/src/platform` | The only OS-specific code: list drives, open raw, reread partitions |
-| `crates/rr-cli` | The `rust-rufus` command |
-| `crates/rr-mcp` | The MCP server behind `rust-rufus mcp` |
+| `crates/bc-core` | All logic: images, safety policy, writing, verifying, hashing |
+| `crates/bc-core/src/platform` | The only OS-specific code: list drives, open raw, reread partitions |
+| `crates/bc-cli` | The `boot-craft` command |
+| `crates/bc-mcp` | The MCP server behind `boot-craft mcp` |
 | `scripts/` | End-to-end tests against virtual disks |
 
 ## License

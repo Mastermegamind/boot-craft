@@ -258,16 +258,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
-name = "rr-cli"
+name = "bc-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
- "rr-core",
- "rr-mcp",
+ "bc-core",
+ "bc-mcp",
 ]
 
 [[package]]
-name = "rr-core"
+name = "bc-core"
 version = "0.1.0"
 dependencies = [
  "libc",
@@ -277,10 +277,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "rr-mcp"
+name = "bc-mcp"
 version = "0.1.0"
 dependencies = [
- "rr-core",
+ "bc-core",
  "serde_json",
  "tempfile",
 ]

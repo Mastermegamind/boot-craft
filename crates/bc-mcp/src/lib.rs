@@ -1,4 +1,4 @@
-//! MCP server: lets AI agents use rust-rufus over stdio (JSON-RPC 2.0,
+//! MCP server: lets AI agents use boot-craft over stdio (JSON-RPC 2.0,
 //! one message per line).
 //!
 //! Agents get the safety rules people get, never more:
@@ -31,10 +31,10 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
 
-use rr_core::hash::{self, Sha256Digest, to_hex};
-use rr_core::image;
-use rr_core::write::{self, Target, Written};
-use rr_core::{Drive, Error, Policy, platform};
+use bc_core::hash::{self, Sha256Digest, to_hex};
+use bc_core::image;
+use bc_core::write::{self, Target, Written};
+use bc_core::{Drive, Error, Policy, platform};
 use serde_json::{Value, json};
 
 /// Newest first; a client asking for another gets the newest.
@@ -211,7 +211,7 @@ impl<D: Drives> Server<D> {
         for job in self.jobs.values_mut() {
             if let Some(thread) = job.thread.take() {
                 if !thread.is_finished() {
-                    eprintln!("rust-rufus mcp: finishing the write to {} before exiting", job.drive);
+                    eprintln!("boot-craft mcp: finishing the write to {} before exiting", job.drive);
                 }
                 let _ = thread.join();
             }
@@ -256,7 +256,7 @@ impl<D: Drives> Server<D> {
                 Ok(json!({
                     "protocolVersion": version,
                     "capabilities": { "tools": { "listChanged": false } },
-                    "serverInfo": { "name": "rust-rufus", "title": "rust-rufus", "version": env!("CARGO_PKG_VERSION") },
+                    "serverInfo": { "name": "boot-craft", "title": "boot-craft", "version": env!("CARGO_PKG_VERSION") },
                     "instructions": self.instructions(),
                 }))
             }
@@ -273,7 +273,7 @@ impl<D: Drives> Server<D> {
 
     fn instructions(&self) -> String {
         let mut text = String::from(
-            "rust-rufus makes bootable USB drives from ISO and disk images. Use list_drives to see drives and whether each \
+            "boot-craft makes bootable USB drives from ISO and disk images. Use list_drives to see drives and whether each \
              may be written, inspect_image to see whether an image boots when written raw, and hash_file to check a download.",
         );
         if self.options.allow_writes {

@@ -6,7 +6,7 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
-BIN=${BIN:-target/debug/rust-rufus}
+BIN=${BIN:-target/debug/boot-craft}
 [ -x "$BIN" ] || { echo "build first: cargo build" >&2; exit 1; }
 [ "$(id -u)" = 0 ] || { echo "needs root: sudo $0" >&2; exit 1; }
 
@@ -52,7 +52,7 @@ head -c 1M /dev/urandom > "$work/junk.bin"
 if "$BIN" write "$work/junk.bin" "$dev" --allow-loop --yes 2>/dev/null; then fail "wrote a non-bootable image without --force"; fi
 pass "a non-bootable image needs --force"
 
-mkfs.vfat -n RRTEST "$dev" >/dev/null
+mkfs.vfat -n BCTEST "$dev" >/dev/null
 mkdir "$work/mnt"
 mount "$dev" "$work/mnt"
 out=$("$BIN" write "$work/image.img" "$dev" --allow-loop --yes 2>&1) && fail "wrote a mounted drive"

@@ -71,7 +71,7 @@ impl ImageKind {
     /// What to do with an image of this kind, in a sentence.
     pub fn advice(self) -> &'static str {
         match self {
-            ImageKind::HybridIso | ImageKind::DiskImage => "It can be written raw with `rust-rufus write`.",
+            ImageKind::HybridIso | ImageKind::DiskImage => "It can be written raw with `boot-craft write`.",
             ImageKind::PlainIso => {
                 "Written raw it won't boot. Windows install ISOs and some older Linux ISOs are like this; \
                  they need the file-copy mode, which isn't built yet (PLAN.md, M3 and M4)."
