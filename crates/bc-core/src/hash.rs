@@ -1,6 +1,7 @@
 //! SHA-256 of images and drives.
 
 use std::io::{self, Read};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use sha2::{Digest, Sha256};
 
@@ -30,10 +31,23 @@ pub fn parse_hex(text: &str) -> Option<Sha256Digest> {
 /// Hashes exactly `len` bytes from `reader`; ending sooner is an error.
 /// `progress` hears the running total.
 pub fn hash_exact<R: Read>(reader: &mut R, len: u64, progress: &mut dyn FnMut(u64)) -> io::Result<Sha256Digest> {
+    hash_exact_until(reader, len, None, progress)
+}
+
+/// [`hash_exact`] that stops with [`cancelled`] once `cancel` is set.
+pub fn hash_exact_until<R: Read>(
+    reader: &mut R,
+    len: u64,
+    cancel: Option<&AtomicBool>,
+    progress: &mut dyn FnMut(u64),
+) -> io::Result<Sha256Digest> {
     let mut buf = vec![0u8; CHUNK];
     let mut hasher = Sha256::new();
     let mut done = 0u64;
     while done < len {
+        if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+            return Err(cancelled());
+        }
         let want = (len - done).min(CHUNK as u64) as usize;
         let n = read_some(reader, &mut buf[..want])?;
         if n == 0 {
@@ -44,6 +58,35 @@ pub fn hash_exact<R: Read>(reader: &mut R, len: u64, progress: &mut dyn FnMut(u6
         progress(done);
     }
     Ok(hasher.finalize().into())
+}
+
+/// Hashes `reader` to its end; returns the digest and the byte count.
+pub fn hash_to_end<R: Read>(reader: &mut R, cancel: Option<&AtomicBool>, progress: &mut dyn FnMut(u64)) -> io::Result<(Sha256Digest, u64)> {
+    let mut buf = vec![0u8; CHUNK];
+    let mut hasher = Sha256::new();
+    let mut done = 0u64;
+    loop {
+        if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+            return Err(cancelled());
+        }
+        let n = read_some(reader, &mut buf)?;
+        if n == 0 {
+            return Ok((hasher.finalize().into(), done));
+        }
+        hasher.update(&buf[..n]);
+        done += n as u64;
+        progress(done);
+    }
+}
+
+/// The error a cancelled hash ends with.
+pub fn cancelled() -> io::Error {
+    io::Error::new(io::ErrorKind::Interrupted, "stopped")
+}
+
+/// Whether `e` is [`cancelled`].
+pub fn is_cancelled(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::Interrupted && e.to_string() == "stopped"
 }
 
 /// One `read`, retried when a signal interrupts it.

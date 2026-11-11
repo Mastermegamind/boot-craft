@@ -340,7 +340,7 @@ mod tests {
         let drive = fake.drive("loop0");
         assert_eq!((drive.transport, drive.model.as_deref()), (Transport::Virtual, Some("/tmp/test.img")));
         assert_eq!(drive.check(&Policy::default()), Err(Refusal::Virtual));
-        assert_eq!(drive.check(&Policy { allow_loop: true }), Ok(()));
+        assert_eq!(drive.check(&Policy { allow_loop: true, ..Policy::default() }), Ok(()));
     }
 
     #[test]

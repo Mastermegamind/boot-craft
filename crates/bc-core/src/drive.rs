@@ -11,6 +11,8 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Transport {
     Usb,
+    /// Another external drive the OS reports as such (Thunderbolt, FireWire...).
+    External,
     /// An SD or MMC card in a card reader (not built-in eMMC storage).
     Sd,
     /// A loop device or attached disk image: for tests only.
@@ -23,6 +25,7 @@ impl fmt::Display for Transport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.pad(match self {
             Transport::Usb => "usb",
+            Transport::External => "external",
             Transport::Sd => "sd card",
             Transport::Virtual => "virtual",
             Transport::Internal => "internal",
@@ -86,6 +89,9 @@ pub struct Drive {
 pub struct Policy {
     /// Allow virtual disks, for tests.
     pub allow_loop: bool,
+    /// Accept drives with mounted volumes, which get unmounted before the
+    /// write. Never the system's volumes; never LVM, LUKS or RAID members.
+    pub unmount: bool,
 }
 
 /// Why a drive may not be erased.
@@ -102,7 +108,10 @@ impl fmt::Display for Refusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Refusal::SystemDisk(usage) => write!(f, "it holds the running system ({usage})"),
-            Refusal::InUse(usage) => write!(f, "{usage}; unmount it first"),
+            Refusal::InUse(usage @ Usage { kind: UsageKind::Mounted(_), .. }) => {
+                write!(f, "{usage}; unmount it first, or pass --unmount")
+            }
+            Refusal::InUse(usage) => write!(f, "{usage}; release it first"),
             Refusal::ReadOnly => f.write_str("it is read-only (check its write-protect switch)"),
             Refusal::Virtual => f.write_str("it is a virtual disk (allowed only for testing, with --allow-loop)"),
             Refusal::Internal => f.write_str("it is an internal disk, not a USB drive or SD card"),
@@ -123,18 +132,24 @@ impl Drive {
         if let Some(usage) = self.usage.iter().find(|u| u.system) {
             return Err(Refusal::SystemDisk(usage.clone()));
         }
-        if let Some(usage) = self.usage.first() {
+        let unmountable = |u: &&Usage| policy.unmount && matches!(u.kind, UsageKind::Mounted(_));
+        if let Some(usage) = self.usage.iter().find(|u| !unmountable(u)) {
             return Err(Refusal::InUse(usage.clone()));
         }
         if self.read_only {
             return Err(Refusal::ReadOnly);
         }
         match self.transport {
-            Transport::Usb | Transport::Sd => Ok(()),
+            Transport::Usb | Transport::External | Transport::Sd => Ok(()),
             Transport::Virtual if policy.allow_loop => Ok(()),
             Transport::Virtual => Err(Refusal::Virtual),
             Transport::Internal => Err(Refusal::Internal),
         }
+    }
+
+    /// Whether anything on the drive is mounted.
+    pub fn mounted(&self) -> bool {
+        self.usage.iter().any(|u| matches!(u.kind, UsageKind::Mounted(_)))
     }
 
     /// Whether `other` is still the same piece of hardware, judged by what
@@ -175,7 +190,7 @@ mod tests {
     #[test]
     fn the_system_disk_is_refused_even_on_usb_and_with_every_option() {
         let drive = Drive { usage: vec![mounted("sdb2", "/", true)], ..stick() };
-        let refusal = drive.check(&Policy { allow_loop: true }).unwrap_err();
+        let refusal = drive.check(&Policy { allow_loop: true, unmount: true }).unwrap_err();
         assert!(matches!(refusal, Refusal::SystemDisk(_)), "{refusal}");
     }
 
@@ -192,6 +207,22 @@ mod tests {
     }
 
     #[test]
+    fn unmount_accepts_mounted_volumes_but_not_held_ones() {
+        let unmount = Policy { unmount: true, ..Policy::default() };
+        let mounted_stick = Drive { usage: vec![mounted("sdb1", "/media/x", false)], ..stick() };
+        assert_eq!(mounted_stick.check(&unmount), Ok(()));
+        assert!(mounted_stick.check(&Policy::default()).unwrap_err().to_string().contains("--unmount"));
+        let held = Usage { part: "sdb1".into(), kind: UsageKind::Held(vec!["dm-0".into()]), system: false };
+        let luks_stick = Drive { usage: vec![held.clone()], ..stick() };
+        assert_eq!(luks_stick.check(&unmount), Err(Refusal::InUse(held)));
+    }
+
+    #[test]
+    fn external_drives_may_be_written() {
+        assert_eq!(Drive { transport: Transport::External, ..stick() }.check(&Policy::default()), Ok(()));
+    }
+
+    #[test]
     fn internal_read_only_and_virtual_drives_are_refused() {
         let policy = Policy::default();
         assert_eq!(Drive { transport: Transport::Internal, ..stick() }.check(&policy), Err(Refusal::Internal));
@@ -202,7 +233,7 @@ mod tests {
     #[test]
     fn virtual_drives_only_with_allow_loop() {
         let drive = Drive { transport: Transport::Virtual, ..stick() };
-        assert_eq!(drive.check(&Policy { allow_loop: true }), Ok(()));
+        assert_eq!(drive.check(&Policy { allow_loop: true, ..Policy::default() }), Ok(()));
     }
 
     #[test]

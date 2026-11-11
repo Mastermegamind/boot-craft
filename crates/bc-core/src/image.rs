@@ -1,19 +1,23 @@
 //! What an image file is, and whether writing it raw makes a bootable drive.
 //!
-//! M0 reads only headers: ISO 9660 volume descriptors, El Torito, MBR and
-//! GPT. Recognising the OS inside (Windows, Linux, macOS, BSD...) comes with
-//! the ISO directory reader in M2.
+//! Only headers are read so far: ISO 9660 volume descriptors, El Torito, MBR
+//! and GPT, from the start of the image (decompressed if need be).
+//! Recognising the OS inside (Windows, Linux, macOS, BSD...) comes with the
+//! ISO directory reader in M2.
 
-use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{self, Cursor, Read, Seek, SeekFrom};
 use std::path::Path;
 
+use crate::error::Error;
 use crate::hash::read_some;
+use crate::source::Source;
 
 const ISO_SECTOR: u64 = 2048;
 /// ISO 9660 volume descriptors start at sector 16; real images have a handful.
 const ISO_FIRST_DESCRIPTOR: u64 = 16;
 const ISO_MAX_DESCRIPTORS: u64 = 64;
+/// Everything the header checks look at lies in this much of the image.
+const HEAD_LEN: u64 = (ISO_FIRST_DESCRIPTOR + ISO_MAX_DESCRIPTORS) * ISO_SECTOR;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IsoInfo {
@@ -23,8 +27,7 @@ pub struct IsoInfo {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ImageInfo {
-    pub size: u64,
+pub struct Header {
     /// A boot-sector signature (`55 AA`) at byte 510.
     pub mbr: bool,
     /// A GPT header ("EFI PART") after 512- or 4096-byte sectors.
@@ -43,7 +46,20 @@ pub enum ImageKind {
     Unknown,
 }
 
+/// An image file: how it's stored, and what its first bytes say.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageInfo {
+    pub source: Source,
+    pub header: Header,
+}
+
 impl ImageInfo {
+    pub fn kind(&self) -> ImageKind {
+        self.header.kind()
+    }
+}
+
+impl Header {
     pub fn kind(&self) -> ImageKind {
         match (&self.iso, self.mbr || self.gpt) {
             (Some(_), true) => ImageKind::HybridIso,
@@ -81,18 +97,20 @@ impl ImageKind {
     }
 }
 
-pub fn inspect(path: &Path) -> io::Result<ImageInfo> {
-    let file = File::open(path)?;
-    let size = file.metadata()?.len();
-    inspect_reader(file, size)
+pub fn inspect(path: &Path) -> Result<ImageInfo, Error> {
+    let source = Source::open(path)?;
+    let mut head = Vec::new();
+    source.stream()?.reader.take(HEAD_LEN).read_to_end(&mut head)?;
+    let header = inspect_reader(Cursor::new(head))?;
+    Ok(ImageInfo { source, header })
 }
 
-pub fn inspect_reader<R: Read + Seek>(mut reader: R, size: u64) -> io::Result<ImageInfo> {
+pub fn inspect_reader<R: Read + Seek>(mut reader: R) -> io::Result<Header> {
     let head = read_at(&mut reader, 0, 4096 + 8)?;
     let mbr = head.get(510..512) == Some(&[0x55, 0xAA]);
     let gpt = [512, 4096].iter().any(|&at| head.get(at..at + 8) == Some(b"EFI PART"));
     let iso = read_iso(&mut reader)?;
-    Ok(ImageInfo { size, mbr, gpt, iso })
+    Ok(Header { mbr, gpt, iso })
 }
 
 fn read_iso<R: Read + Seek>(reader: &mut R) -> io::Result<Option<IsoInfo>> {
@@ -132,7 +150,6 @@ fn read_at<R: Read + Seek>(reader: &mut R, offset: u64, len: usize) -> io::Resul
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
 
     fn descriptor(kind: u8) -> Vec<u8> {
         let mut d = vec![0u8; ISO_SECTOR as usize];
@@ -163,9 +180,8 @@ mod tests {
         image
     }
 
-    fn info(bytes: Vec<u8>) -> ImageInfo {
-        let size = bytes.len() as u64;
-        inspect_reader(Cursor::new(bytes), size).unwrap()
+    fn info(bytes: Vec<u8>) -> Header {
+        inspect_reader(Cursor::new(bytes)).unwrap()
     }
 
     #[test]
@@ -204,5 +220,19 @@ mod tests {
         assert_eq!(info(vec![7u8; 100_000]).kind(), ImageKind::Unknown);
         assert_eq!(info(vec![1, 2, 3]).kind(), ImageKind::Unknown);
         assert_eq!(info(Vec::new()).kind(), ImageKind::Unknown);
+    }
+
+    #[test]
+    fn inspect_looks_inside_compressed_images() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ubuntu.iso.gz");
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gz.write_all(&iso("Ubuntu", true, true)).unwrap();
+        std::fs::write(&path, gz.finish().unwrap()).unwrap();
+        let info = inspect(&path).unwrap();
+        assert_eq!(info.kind(), ImageKind::HybridIso);
+        assert_eq!(info.source.compression, crate::source::Compression::Gzip);
+        assert_eq!(info.header.iso.unwrap().volume_id, "Ubuntu");
     }
 }

@@ -18,6 +18,12 @@ pub enum Error {
     NeedsAdmin,
     #[error("the image is {image} bytes, larger than the drive ({drive} bytes)")]
     TooSmall { image: u64, drive: u64 },
+    #[error("the image is larger than the drive ({drive} bytes); the drive is only partly written and won't boot")]
+    TooBigWhileWriting { drive: u64 },
+    #[error("{0}")]
+    UnsupportedImage(String),
+    #[error("stopped")]
+    Cancelled,
     #[error("the image is empty")]
     EmptyImage,
     #[error("the image got shorter while it was being written")]

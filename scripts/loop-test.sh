@@ -58,7 +58,36 @@ mount "$dev" "$work/mnt"
 out=$("$BIN" write "$work/image.img" "$dev" --allow-loop --yes 2>&1) && fail "wrote a mounted drive"
 grep -q "is mounted at" <<<"$out" || fail "unexpected refusal: $out"
 pass "a mounted drive is refused ($out)"
-umount "$work/mnt"
+"$BIN" write "$work/image.img" "$dev" --allow-loop --unmount --yes 2>/dev/null || fail "--unmount didn't write the mounted drive"
+mountpoint -q "$work/mnt" && fail "--unmount left the volume mounted"
+cmp -n $((40 << 20)) "$work/image.img" "$dev" || fail "--unmount: drive doesn't match the image"
+pass "--unmount unmounts the drive's volume, then writes and verifies"
+
+# Compressed images, decompressed while writing.
+for fmt in xz gz zst bz2 zip; do
+    dd if=/dev/zero of="$dev" bs=1M count=48 status=none
+    case $fmt in
+        xz) xz -T0 -1 -c "$work/image.img" > "$work/image.img.xz" ;;
+        gz) gzip -1 -c "$work/image.img" > "$work/image.img.gz" ;;
+        zst) zstd -q -1 -c "$work/image.img" > "$work/image.img.zst" ;;
+        bz2) bzip2 -1 -c "$work/image.img" > "$work/image.img.bz2" ;;
+        zip) (cd "$work" && zip -q -1 image.img.zip image.img) ;;
+    esac
+    "$BIN" write "$work/image.img.$fmt" "$dev" --allow-loop --yes 2>/dev/null || fail "writing the .$fmt image failed"
+    cmp -n $((40 << 20)) "$work/image.img" "$dev" || fail ".$fmt: drive doesn't match the image"
+    rm "$work/image.img.$fmt"
+done
+pass "xz, gzip, zstd, bzip2 and zip images are decompressed while writing, verified, identical"
+
+# A SHA256SUMS next to the image is checked without being asked.
+echo "$(printf '0%.0s' {1..64})  image.img" > "$work/SHA256SUMS"
+out=$("$BIN" write "$work/image.img" "$dev" --allow-loop --yes 2>&1) && fail "wrote despite a wrong SHA256SUMS"
+grep -q "SHA256SUMS says" <<<"$out" || fail "unexpected refusal: $out"
+(cd "$work" && sha256sum image.img > SHA256SUMS)
+out=$("$BIN" write "$work/image.img" "$dev" --allow-loop --yes 2>&1) || fail "write with a correct SHA256SUMS failed: $out"
+grep -q "SHA-256 matches .*SHA256SUMS" <<<"$out" || fail "SHA256SUMS not checked: $out"
+rm "$work/SHA256SUMS"
+pass "a SHA256SUMS next to the image is checked automatically"
 
 # The same write through MCP, as an agent would do it: prepare, then confirm.
 dd if=/dev/zero of="$dev" bs=1M count=48 status=none

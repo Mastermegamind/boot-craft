@@ -6,10 +6,13 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
+use std::fmt;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use bc_core::hash::{self, Sha256Digest, to_hex};
-use bc_core::image;
-use bc_core::write::{self, Target};
-use bc_core::{Drive, Policy, platform};
+use bc_core::write::{self, Target, WriteProgress};
+use bc_core::{Drive, Error, Policy, checksums, image, platform};
 use clap::{Args, Parser, Subcommand};
 
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -51,7 +54,8 @@ struct WriteArgs {
     image: PathBuf,
     /// The drive, as `list` shows it: sdb or /dev/sdb
     drive: String,
-    /// The image's expected SHA-256, checked before anything is erased
+    /// The image's expected SHA-256, checked before anything is erased.
+    /// Without it, a SHA256SUMS (or similar) file next to the image is used.
     #[arg(long, value_name = "HEX")]
     sha256: Option<String>,
     /// Don't read the drive back afterwards
@@ -63,14 +67,33 @@ struct WriteArgs {
     /// Allow loop devices (for testing)
     #[arg(long)]
     allow_loop: bool,
+    /// Unmount the drive's volumes first instead of refusing (never the system's)
+    #[arg(long)]
+    unmount: bool,
     /// Don't ask for confirmation
     #[arg(long, short)]
     yes: bool,
 }
 
+/// The user stopped the command (Ctrl-C); exits with 130 like an interrupted program.
+#[derive(Debug)]
+struct Stopped(String);
+
+impl fmt::Display for Stopped {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Stopped {}
+
 fn main() -> ExitCode {
     match run(Cli::parse()) {
         Ok(()) => ExitCode::SUCCESS,
+        Err(e) if e.is::<Stopped>() => {
+            eprintln!("{e}");
+            ExitCode::from(130)
+        }
         Err(e) => {
             eprintln!("error: {e}");
             ExitCode::FAILURE
@@ -78,12 +101,28 @@ fn main() -> ExitCode {
     }
 }
 
+/// A flag Ctrl-C sets, so long work can stop cleanly; a second Ctrl-C quits at once.
+fn stop_on_ctrl_c() -> Arc<AtomicBool> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&stop);
+    let installed = ctrlc::set_handler(move || {
+        if flag.swap(true, Ordering::SeqCst) {
+            std::process::exit(130);
+        }
+        eprintln!("\nStopping... (Ctrl-C again to quit at once)");
+    });
+    if let Err(e) = installed {
+        eprintln!("note: Ctrl-C won't stop cleanly ({e})");
+    }
+    stop
+}
+
 fn run(cli: Cli) -> Result {
     match cli.command {
-        Command::List { allow_loop } => list(&Policy { allow_loop }),
+        Command::List { allow_loop } => list(&Policy { allow_loop, ..Policy::default() }),
         Command::Info { image } => info(&image),
         Command::Hash { file } => {
-            let digest = hash_file(&file)?;
+            let digest = hash_file(&file, &stop_on_ctrl_c())?;
             println!("{}  {}", to_hex(&digest), file.display());
             Ok(())
         }
@@ -114,23 +153,32 @@ fn list(policy: &Policy) -> Result {
 
 fn info(path: &Path) -> Result {
     let info = image::inspect(path)?;
-    let kind = info.kind();
-    println!("File:      {}", path.display());
-    println!("Size:      {} ({} bytes)", size(info.size), info.size);
+    let (kind, source, header) = (info.kind(), &info.source, &info.header);
+    println!("File:      {} ({})", path.display(), size(source.file_size));
+    println!("Stored:    {}", source.describe());
+    match source.size {
+        Some(bytes) => println!("Image:     {} ({bytes} bytes)", size(bytes)),
+        None => println!("Image:     size known only once decompressed"),
+    }
     println!("Kind:      {}", kind.describe());
-    if let Some(iso) = &info.iso {
+    if let Some(iso) = &header.iso {
         println!("Label:     {}", iso.volume_id);
         println!("El Torito: {}", yes_no(iso.el_torito));
     }
-    println!("MBR:       {}", yes_no(info.mbr));
-    println!("GPT:       {}", yes_no(info.gpt));
+    println!("MBR:       {}", yes_no(header.mbr));
+    println!("GPT:       {}", yes_no(header.gpt));
+    match checksums::find(path) {
+        Some(published) => println!("Checksum:  listed in {} (checked by `write`)", published.from.display()),
+        None => println!("Checksum:  no SHA256SUMS or .sha256 file next to it"),
+    }
     println!();
     println!("{}", kind.advice());
     Ok(())
 }
 
 fn write_image(args: &WriteArgs) -> Result {
-    let policy = Policy { allow_loop: args.allow_loop };
+    let policy = Policy { allow_loop: args.allow_loop, unmount: args.unmount };
+    let stop = stop_on_ctrl_c();
 
     // Everything that can go wrong without touching the drive comes first.
     let info = image::inspect(&args.image)?;
@@ -138,44 +186,89 @@ fn write_image(args: &WriteArgs) -> Result {
     if !kind.boots_when_written_raw() && !args.force {
         return Err(format!("{} is {}.\n{}\nPass --force to write it anyway.", args.image.display(), kind.describe(), kind.advice()).into());
     }
-    if let Some(expected) = &args.sha256 {
-        let expected = hash::parse_hex(expected).ok_or("--sha256 takes 64 hex digits")?;
-        let actual = hash_file(&args.image)?;
+    let expected = match &args.sha256 {
+        Some(hex) => Some((hash::parse_hex(hex).ok_or("--sha256 takes 64 hex digits")?, "--sha256".to_string())),
+        None => checksums::find(&args.image).map(|p| (p.sha256, p.from.display().to_string())),
+    };
+    if let Some((expected, from)) = expected {
+        let actual = hash_file(&args.image, &stop).map_err(|e| stopped_or(e, "Stopped; nothing was written."))?;
         if actual != expected {
             return Err(format!(
-                "the image's SHA-256 is {}, not {}: the download is damaged or it's a different file. Nothing was written.",
+                "the image's SHA-256 is {}, but {from} says {}: the download is damaged or it's a different file. Nothing was written.",
                 to_hex(&actual),
                 to_hex(&expected)
             )
             .into());
         }
-        eprintln!("SHA-256 matches.");
+        eprintln!("SHA-256 matches {from}.");
     }
     let drive = platform::find_drive(&args.drive)?.ok_or_else(|| format!("no drive named {}; see `boot-craft list`", args.drive))?;
     drive.check(&policy).map_err(|reason| format!("{} can't be written: {reason}", drive.name))?;
-    write::fits(info.size, drive.size_bytes)?;
-    confirm(&drive, &args.image, args.yes)?;
+    if let Some(bytes) = info.source.size {
+        write::fits(bytes, drive.size_bytes)?;
+    }
+    confirm(&drive, &args.image, policy.unmount, args.yes)?;
+    if stop.load(Ordering::SeqCst) {
+        return Err(Stopped("Stopped; nothing was written.".into()).into());
+    }
 
     let mut target = Target::open(&drive, &policy)?;
-    let mut meter = Meter::new("Writing  ", info.size);
-    let written = target.write_image(&args.image, &mut |done| meter.update(done))?;
+    target.cancel_on(Arc::clone(&stop));
+    let (total, file_size) = (info.source.size, info.source.file_size.max(1));
+    let mut meter = Meter::new("Writing  ", total);
+    let written = target
+        .write_image(&info.source, &mut |p: WriteProgress| {
+            let ratio = match total {
+                Some(total) => p.written as f64 / total.max(1) as f64,
+                None => p.file_read as f64 / file_size as f64,
+            };
+            meter.update(p.written, ratio);
+        })
+        .map_err(|e| {
+            let partly = format!("Stopped. {} is only partly written and won't boot; write it again or format it.", drive.name);
+            stopped_or(e, &partly)
+        })?;
+    meter.finish(written.bytes);
     if let Err(e) = &written.reread {
         eprintln!("note: the system didn't reread the new partition table ({e}); unplug and replug the drive to see it");
     }
     if !args.no_verify {
-        let mut meter = Meter::new("Verifying", written.bytes);
-        target.verify(&written, &mut |done| meter.update(done))?;
+        let mut meter = Meter::new("Verifying", Some(written.bytes));
+        target
+            .verify(&written, &mut |done| meter.update(done, done as f64 / written.bytes as f64))
+            .map_err(|e| stopped_or(e, "Stopped while verifying: the image was written in full, but not checked."))?;
+        meter.finish(written.bytes);
         eprintln!("Verified: the drive matches the image (SHA-256 {}).", to_hex(&written.sha256));
     }
     eprintln!("Done. {} can be removed.", drive.name);
     Ok(())
 }
 
+/// `message` as a [`Stopped`] if `e` is a cancellation, else `e` itself.
+fn stopped_or(e: impl Into<Box<dyn std::error::Error>>, message: &str) -> Box<dyn std::error::Error> {
+    let e = e.into();
+    let cancelled = matches!(e.downcast_ref::<Error>(), Some(Error::Cancelled))
+        || e.downcast_ref::<io::Error>().is_some_and(hash::is_cancelled)
+        || e.is::<Stopped>();
+    if cancelled { Box::new(Stopped(message.into())) } else { e }
+}
+
 /// Says what will be erased and, unless `yes`, has the user type the drive's name.
-fn confirm(drive: &Drive, image: &Path, yes: bool) -> Result {
+fn confirm(drive: &Drive, image: &Path, unmount: bool, yes: bool) -> Result {
     eprintln!("This erases everything on {} ({}, {}):", drive.path.display(), drive.label(), size(drive.size_bytes));
     for partition in &drive.partitions {
         eprintln!("  {}  {}", partition.name, size(partition.size_bytes));
+    }
+    if unmount && drive.mounted() {
+        let mounted: Vec<String> = drive
+            .usage
+            .iter()
+            .filter_map(|u| match &u.kind {
+                bc_core::UsageKind::Mounted(at) => Some(at.display().to_string()),
+                _ => None,
+            })
+            .collect();
+        eprintln!("unmounting {} first,", mounted.join(", "));
     }
     eprintln!("and writes {} to it.", image.display());
     if yes {
@@ -191,43 +284,61 @@ fn confirm(drive: &Drive, image: &Path, yes: bool) -> Result {
     if line.trim() == drive.name { Ok(()) } else { Err("not confirmed; nothing was written".into()) }
 }
 
-fn hash_file(path: &Path) -> Result<Sha256Digest> {
+/// The SHA-256 of the file itself, as publishers list it (of the `.xz`, not
+/// of what's inside).
+fn hash_file(path: &Path, stop: &AtomicBool) -> Result<Sha256Digest> {
     let mut file = File::open(path)?;
     let len = file.metadata()?.len();
-    let mut meter = Meter::new("Hashing  ", len);
-    Ok(hash::hash_exact(&mut file, len, &mut |done| meter.update(done))?)
+    let mut meter = Meter::new("Hashing  ", Some(len));
+    let digest = hash::hash_exact_until(&mut file, len, Some(stop), &mut |done| meter.update(done, done as f64 / len.max(1) as f64))
+        .map_err(|e| stopped_or(e, "Stopped."))?;
+    meter.finish(len);
+    Ok(digest)
 }
 
 /// A progress line on stderr, redrawn at most five times a second.
 struct Meter {
     label: &'static str,
-    total: u64,
+    total: Option<u64>,
     start: Instant,
     last: Option<Instant>,
     shown: bool,
 }
 
 impl Meter {
-    fn new(label: &'static str, total: u64) -> Self {
+    /// `total` is `None` when the size isn't known in advance (compressed images).
+    fn new(label: &'static str, total: Option<u64>) -> Self {
         Self { label, total, start: Instant::now(), last: None, shown: io::stderr().is_terminal() }
     }
 
-    fn update(&mut self, done: u64) {
-        if !self.shown {
-            return;
-        }
+    /// `ratio` is how far along the work is, from 0 to 1.
+    fn update(&mut self, done: u64, ratio: f64) {
         let now = Instant::now();
-        let finished = done >= self.total;
-        if !finished && self.last.is_some_and(|last| now - last < Duration::from_millis(200)) {
+        if self.last.is_some_and(|last| now - last < Duration::from_millis(200)) {
             return;
         }
         self.last = Some(now);
-        let seconds = (now - self.start).as_secs_f64().max(0.001);
-        let percent = (done * 100).checked_div(self.total).unwrap_or(100);
-        eprint!("\r{} {percent:>3}%  {} / {}  {}/s   ", self.label, size(done), size(self.total), size((done as f64 / seconds) as u64));
-        if finished {
+        self.draw(done, ratio);
+    }
+
+    fn finish(&mut self, done: u64) {
+        if self.shown && self.last.is_some() {
+            self.draw(done, 1.0);
             eprintln!();
         }
+    }
+
+    fn draw(&self, done: u64, ratio: f64) {
+        if !self.shown {
+            return;
+        }
+        let seconds = self.start.elapsed().as_secs_f64().max(0.001);
+        let percent = (ratio.clamp(0.0, 1.0) * 100.0) as u32;
+        let amount = match self.total {
+            Some(total) => format!("{} / {}", size(done), size(total)),
+            None => size(done),
+        };
+        eprint!("\r{} {percent:>3}%  {amount}  {}/s   ", self.label, size((done as f64 / seconds) as u64));
     }
 }
 

@@ -1,4 +1,4 @@
-use std::io::Cursor;
+use std::io::{Cursor, Read};
 
 use bc_core::Transport;
 
@@ -40,19 +40,37 @@ fn drive(name: &str, transport: Transport) -> Drive {
 
 impl Drives for FakeDrives {
     fn list(&self) -> io::Result<Vec<Drive>> {
-        Ok(vec![drive("nvme0n1", Transport::Internal), drive("sdb", Transport::Usb)])
+        let mut mounted = drive("sdc", Transport::Usb);
+        mounted.usage.push(bc_core::Usage { part: "sdc1".into(), kind: bc_core::UsageKind::Mounted("/media/STICK".into()), system: false });
+        Ok(vec![drive("nvme0n1", Transport::Internal), drive("sdb", Transport::Usb), mounted])
     }
 
     fn find(&self, name: &str) -> io::Result<Option<Drive>> {
         Ok(self.list()?.into_iter().find(|d| d.name == name.strip_prefix("/dev/").unwrap_or(name)))
     }
 
-    fn write(&self, drive: &Drive, _policy: &Policy, image: &Path, progress: &mut dyn FnMut(Phase, u64)) -> Result<Written, Error> {
-        self.writes.lock().unwrap().push((drive.name.clone(), image.to_path_buf()));
-        let bytes = fs::read(image)?;
+    fn write(
+        &self,
+        drive: &Drive,
+        _policy: &Policy,
+        source: &Source,
+        cancel: Arc<AtomicBool>,
+        progress: &mut dyn FnMut(Phase, u64),
+    ) -> Result<Written, Error> {
+        self.writes.lock().unwrap().push((drive.name.clone(), source.path.clone()));
+        let mut bytes = Vec::new();
+        source.stream()?.reader.read_to_end(&mut bytes)?;
         progress(Phase::Writing, bytes.len() as u64 / 2);
         let (open, opened) = &*self.gate;
-        let _open = opened.wait_while(open.lock().unwrap(), |open| !*open).unwrap();
+        let guard = open.lock().unwrap();
+        let mut open_now = guard;
+        while !*open_now && !cancel.load(Ordering::SeqCst) {
+            open_now = opened.wait_timeout(open_now, Duration::from_millis(10)).unwrap().0;
+        }
+        drop(open_now);
+        if cancel.load(Ordering::SeqCst) {
+            return Err(Error::Cancelled);
+        }
         if self.fail {
             return Err(Error::Io(io::Error::other("the stick was pulled out")));
         }
@@ -212,6 +230,7 @@ fn read_only_unless_writes_are_allowed() {
         ("prepare_write", json!({ "image": image, "drive": "sdb" })),
         ("confirm_write", json!({ "token": "x", "drive": "sdb" })),
         ("write_status", json!({ "job_id": "x" })),
+        ("cancel_write", json!({ "job_id": "x" })),
     ] {
         let (is_error, text) = h.call(tool, args);
         assert!(is_error && text.as_str().unwrap().contains("--allow-writes"), "{tool}: {text}");
@@ -219,17 +238,21 @@ fn read_only_unless_writes_are_allowed() {
     assert_eq!(h.writes(), 0);
 
     let mut h = Harness::writable();
-    assert_eq!(tool_names(&mut h), ["list_drives", "inspect_image", "hash_file", "prepare_write", "confirm_write", "write_status"]);
+    assert_eq!(
+        tool_names(&mut h),
+        ["list_drives", "inspect_image", "hash_file", "prepare_write", "confirm_write", "write_status", "cancel_write"]
+    );
 }
 
 #[test]
-fn only_confirm_write_is_marked_destructive() {
+fn only_confirm_write_is_destructive_and_only_it_and_cancel_change_anything() {
     let mut h = Harness::writable();
     let reply = h.request("tools/list", json!({}));
     for tool in reply["result"]["tools"].as_array().unwrap() {
         let destructive = tool["annotations"]["destructiveHint"].as_bool().unwrap_or(false);
         assert_eq!(destructive, tool["name"] == "confirm_write", "{}", tool["name"]);
-        assert_eq!(tool["annotations"]["readOnlyHint"], tool["name"] != "confirm_write");
+        let changes_things = tool["name"] == "confirm_write" || tool["name"] == "cancel_write";
+        assert_eq!(tool["annotations"]["readOnlyHint"], !changes_things, "{}", tool["name"]);
     }
 }
 
@@ -438,4 +461,69 @@ fn serves_line_by_line_over_stdio() {
     assert_eq!(replies.len(), 2, "the notification gets no reply");
     assert_eq!(replies[0]["id"], 1);
     assert_eq!(replies[1]["result"]["tools"].as_array().unwrap().len(), 3);
+}
+
+#[test]
+fn a_compressed_image_is_bound_by_what_goes_on_the_drive() {
+    use std::io::Write as _;
+    let mut h = Harness::writable();
+    let plain = fs::read(&h.image).unwrap();
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    gz.write_all(&plain).unwrap();
+    let packed = h._dir.path().join("disk.img.gz");
+    fs::write(&packed, gz.finish().unwrap()).unwrap();
+    let packed = packed.display().to_string();
+
+    let (is_error, data) = h.call("prepare_write", json!({ "image": packed, "drive": "sdb" }));
+    assert!(!is_error, "{data}");
+    assert_eq!(data["image"]["stored"], "gzip-compressed");
+    assert_eq!(data["image"]["size_bytes"], plain.len());
+    let plain_sha = to_hex(&hash::hash_exact(&mut Cursor::new(&plain), plain.len() as u64, &mut |_| {}).unwrap());
+    assert_eq!(data["image"]["sha256"], plain_sha, "the token is bound to the decompressed bytes");
+    let token = data["token"].as_str().unwrap().to_string();
+    let (_, started) = h.call("confirm_write", json!({ "token": token, "drive": "sdb" }));
+    let status = h.status(started["job_id"].as_str().unwrap(), 5);
+    assert_eq!(status["status"], "done", "{status}");
+    assert_eq!(status["result"]["sha256"], plain_sha);
+}
+
+#[test]
+fn a_checksum_file_next_to_the_image_is_checked() {
+    let mut h = Harness::writable();
+    let image = h.image();
+    fs::write(h._dir.path().join("SHA256SUMS"), format!("{}  disk.img\n", "0".repeat(64))).unwrap();
+    let (is_error, text) = h.call("prepare_write", json!({ "image": image, "drive": "sdb" }));
+    assert!(is_error && text.as_str().unwrap().contains("SHA256SUMS says"), "{text}");
+
+    let real = to_hex(&hash::hash_exact(&mut Cursor::new(fs::read(&h.image).unwrap()), 8192, &mut |_| {}).unwrap());
+    fs::write(h._dir.path().join("SHA256SUMS"), format!("{real}  disk.img\n")).unwrap();
+    let (is_error, data) = h.call("prepare_write", json!({ "image": image, "drive": "sdb" }));
+    assert!(!is_error, "{data}");
+    assert!(data["image"]["checksum_matches"].as_str().unwrap().ends_with("SHA256SUMS"));
+}
+
+#[test]
+fn cancel_write_stops_a_running_write() {
+    let mut h = Harness::held();
+    let job = h.start();
+    h.halfway(&job);
+    let (is_error, data) = h.call("cancel_write", json!({ "job_id": job }));
+    assert!(!is_error, "{data}");
+    let status = h.status(&job, 5);
+    assert_eq!(status["status"], "failed", "{status}");
+    assert!(status["error"].as_str().unwrap().contains("only partly written"), "{status}");
+    let (is_error, text) = h.call("cancel_write", json!({ "job_id": job }));
+    assert!(is_error && text.as_str().unwrap().contains("already ended"), "{text}");
+}
+
+#[test]
+fn a_mounted_stick_needs_unmount_and_the_summary_says_so() {
+    let mut h = Harness::writable();
+    let image = h.image();
+    let (is_error, text) = h.call("prepare_write", json!({ "image": image, "drive": "sdc" }));
+    assert!(is_error && text.as_str().unwrap().contains("pass unmount: true"), "{text}");
+    let reply =
+        h.request("tools/call", json!({ "name": "prepare_write", "arguments": { "image": image, "drive": "sdc", "unmount": true } }));
+    let text = reply["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("it will unmount /media/STICK first"), "{text}");
 }

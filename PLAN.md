@@ -70,6 +70,7 @@ local server, e.g. for Claude Code:
 | `prepare_write` | Runs every check the CLI runs (image kind, `sha256`, drive policy, size) and returns a summary of what would be erased plus a one-time token valid for 2 minutes | yes |
 | `confirm_write` | Takes the token *and* the drive name again, re-checks the drive, and starts the write + verify in the background; returns a `job_id` at once | yes |
 | `write_status` | Phase (writing / verifying), bytes done, percent, speed; then done (verified SHA-256) or failed (why). `wait_seconds` (≤ 30) waits for the end | yes |
+| `cancel_write` | Stops a running write; the drive is left partly written until written again | yes |
 
 Rules:
 
@@ -91,7 +92,7 @@ Rules:
       (`write_status`, `hash_file`, `prepare_write`), at most twice a second
 - [x] One write per drive at a time; if the client goes away mid-write, the
       server finishes the write before exiting
-- [ ] Cancel a write (`cancel_write`), leaving the drive marked as unusable
+- [x] Cancel a write (`cancel_write`), leaving the drive marked as unusable
 - [ ] Later milestones add tools as features land: `list_image_files` (M2),
       `make_windows_usb` with the Windows 11 options (M3), `make_macos_recovery` (M4)
 - [x] Tests drive the server over in-memory stdio: handshake, tool listing with
@@ -106,11 +107,13 @@ Rules:
 - [ ] End-to-end tests on virtual disks: loop (Linux), `hdiutil attach -nomount`
       (macOS), `diskpart`-created VHD (Windows), run in CI
 - [ ] `--unmount` instead of refusing mounted drives
-- [ ] Ctrl-C: stop cleanly and say the drive is now unusable until rewritten
-- [ ] Compressed images: `.xz`, `.gz`, `.zst`, `.bz2`, `.zip`, written while
-      decompressing (pure-Rust decoders, so nothing to install on any OS)
-- [ ] Fixed-size `.vhd` (strip the footer) alongside `.img` / `.raw` / `.dd`
-- [ ] Pick up `SHA256SUMS` next to the image automatically
+- [x] Ctrl-C: stop cleanly and say the drive is now unusable until rewritten
+- [x] Compressed images: `.xz`, `.gz`, `.zst`, `.bz2`, `.zip`, written while
+      decompressing (pure-Rust decoders, so nothing to install on any OS);
+      recognised by their first bytes, not their names
+- [x] Fixed-size `.vhd` (strip the footer) alongside `.img` / `.raw` / `.dd`
+- [x] Pick up `SHA256SUMS`, `<image>.sha256` or Fedora's `*-CHECKSUM` next to the
+      image automatically (integrity, not authenticity)
 - [ ] Hot-plug: lists update when a stick is plugged in
 - [ ] Tested raw images: Ubuntu, Fedora, Debian, Arch, Kali, Tails, FreeBSD /
       OpenBSD memstick, ChromeOS Flex, Raspberry Pi OS

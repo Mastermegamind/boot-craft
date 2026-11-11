@@ -4,14 +4,17 @@
 mod mounts;
 mod sysfs;
 
+use std::ffi::CString;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 
 pub use sysfs::Roots;
 
-use crate::drive::Drive;
+use super::Opened;
+use crate::drive::{Drive, UsageKind};
 use crate::error::Error;
 
 /// `_IO(0x12, 95)`: reread the partition table.
@@ -27,14 +30,44 @@ pub fn find_drive(name: &str) -> io::Result<Option<Drive>> {
     sysfs::find(&Roots::default(), name)
 }
 
-pub fn open_exclusive(drive: &Drive) -> Result<File, Error> {
+pub fn unmount(drive: &Drive) -> Result<(), Error> {
+    let mut points: Vec<_> = drive
+        .usage
+        .iter()
+        .filter_map(|u| match &u.kind {
+            UsageKind::Mounted(at) if !u.system => Some(at.clone()),
+            _ => None,
+        })
+        .collect();
+    // Nested mounts first.
+    points.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
+    points.dedup();
+    for point in points {
+        let path = CString::new(point.as_os_str().as_bytes()).map_err(|_| io::Error::other("mount point with a NUL byte"))?;
+        // SAFETY: `path` is a valid NUL-terminated string for the call.
+        if unsafe { libc::umount2(path.as_ptr(), 0) } != 0 {
+            let e = io::Error::last_os_error();
+            return Err(match e.raw_os_error() {
+                Some(libc::EBUSY) => Error::Busy(format!("{} (mounted at {})", drive.name, point.display())),
+                Some(libc::EPERM) => Error::NeedsAdmin,
+                _ => Error::Io(io::Error::other(format!("couldn't unmount {}: {e}", point.display()))),
+            });
+        }
+    }
+    Ok(())
+}
+
+pub fn open_exclusive(drive: &Drive) -> Result<Opened, Error> {
     // On a block device, O_EXCL means "fail with EBUSY if anything has it
     // mounted or claimed", not "create": the kernel's own last check.
-    OpenOptions::new().read(true).write(true).custom_flags(libc::O_EXCL).open(&drive.path).map_err(|e| match e.raw_os_error() {
-        Some(libc::EBUSY) => Error::Busy(drive.name.clone()),
-        Some(libc::EACCES | libc::EPERM) => Error::NeedsAdmin,
-        _ => Error::Io(e),
-    })
+    let file =
+        OpenOptions::new().read(true).write(true).custom_flags(libc::O_EXCL).open(&drive.path).map_err(|e| match e.raw_os_error() {
+            Some(libc::EBUSY) => Error::Busy(drive.name.clone()),
+            Some(libc::EACCES | libc::EPERM) => Error::NeedsAdmin,
+            _ => Error::Io(e),
+        })?;
+    // The page cache takes writes of any length.
+    Ok(Opened { file, sector: 1, hold: None })
 }
 
 pub fn drop_cache(file: &File) {

@@ -73,3 +73,16 @@ jobs:
       - run: sudo apt-get install -y dosfstools
       - run: cargo build --locked
       - run: sudo scripts/loop-test.sh
+
+  # Real writes on macOS, to a RAM disk: no real drive is touched.
+  macos-disk:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.85"
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked
+      - run: sudo scripts/macos-test.sh
+

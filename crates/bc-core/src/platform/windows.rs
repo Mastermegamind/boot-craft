@@ -6,6 +6,7 @@
 use std::fs::File;
 use std::io;
 
+use super::Opened;
 use crate::drive::Drive;
 use crate::error::Error;
 
@@ -21,7 +22,11 @@ pub fn find_drive(_name: &str) -> io::Result<Option<Drive>> {
     Err(unsupported())
 }
 
-pub fn open_exclusive(_drive: &Drive) -> Result<File, Error> {
+pub fn unmount(_drive: &Drive) -> Result<(), Error> {
+    Err(unsupported().into())
+}
+
+pub fn open_exclusive(_drive: &Drive) -> Result<Opened, Error> {
     Err(unsupported().into())
 }
 

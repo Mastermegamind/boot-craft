@@ -17,7 +17,7 @@ The tool looks inside the image to work out what it is and how to write it.
 |---|---|---|---|
 | Linux hybrid ISOs | Ubuntu, Fedora, Debian, Mint, Arch, Kali, Parrot, Tails | raw write + verify | done (Linux) |
 | BSD, ChromeOS Flex, ARM boards | FreeBSD memstick, ChromeOS Flex `.bin`, Raspberry Pi OS `.img` | raw write + verify | done (Linux) |
-| Compressed images | `.xz`, `.gz`, `.zst`, `.bz2`, `.zip` | decompressed while writing | planned (M1) |
+| Compressed images | `.xz`, `.gz`, `.zst`, `.bz2`, `.zip`, fixed `.vhd` | decompressed while writing | done (Linux) |
 | Windows install ISOs | Windows 10 / 11, Server | file copy, FAT32 or NTFS, Windows 11 options | planned (M3) |
 | Windows PE ISOs | Hiren's BootCD PE | file copy | planned (M3) |
 | Non-hybrid Linux / rescue ISOs | older distros | file copy + GRUB / Syslinux | planned (M4) |
@@ -47,7 +47,11 @@ sudo boot-craft write ubuntu.iso sdb --sha256 <expected>   # check the image fir
 
 `write` asks you to type the drive's name before erasing it (`--yes` skips
 that for scripts). It reads the drive back afterwards and compares hashes
-(`--no-verify` skips that).
+(`--no-verify` skips that). Compressed images (`.xz`, `.gz`, `.zst`, `.bz2`,
+`.zip`) are written directly, without unpacking them first. If a
+`SHA256SUMS` (or `<image>.sha256`) file sits next to the image, the image is
+checked against it before anything is erased. Ctrl-C stops cleanly and says
+what state the drive is in.
 
 ## AI agents (MCP)
 

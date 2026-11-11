@@ -27,14 +27,16 @@ use std::fs::{self, File};
 use std::hash::{BuildHasher, Hasher};
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
 
 use bc_core::hash::{self, Sha256Digest, to_hex};
-use bc_core::image;
+use bc_core::source::{Compression, Source};
 use bc_core::write::{self, Target, Written};
 use bc_core::{Drive, Error, Policy, platform};
+use bc_core::{checksums, image};
 use serde_json::{Value, json};
 
 /// Newest first; a client asking for another gets the newest.
@@ -71,9 +73,17 @@ pub enum Phase {
 pub trait Drives: Send + Sync + 'static {
     fn list(&self) -> io::Result<Vec<Drive>>;
     fn find(&self, name: &str) -> io::Result<Option<Drive>>;
-    /// Erases `drive`, writes `image`, and verifies it, telling `progress`
-    /// the phase and the bytes done in it.
-    fn write(&self, drive: &Drive, policy: &Policy, image: &Path, progress: &mut dyn FnMut(Phase, u64)) -> Result<Written, Error>;
+    /// Erases `drive`, writes `source`, and verifies it, telling `progress`
+    /// the phase and the bytes done in it. Stops with [`Error::Cancelled`]
+    /// once `cancel` is set.
+    fn write(
+        &self,
+        drive: &Drive,
+        policy: &Policy,
+        source: &Source,
+        cancel: Arc<AtomicBool>,
+        progress: &mut dyn FnMut(Phase, u64),
+    ) -> Result<Written, Error>;
 }
 
 pub struct SystemDrives;
@@ -87,9 +97,17 @@ impl Drives for SystemDrives {
         platform::find_drive(name)
     }
 
-    fn write(&self, drive: &Drive, policy: &Policy, image: &Path, progress: &mut dyn FnMut(Phase, u64)) -> Result<Written, Error> {
+    fn write(
+        &self,
+        drive: &Drive,
+        policy: &Policy,
+        source: &Source,
+        cancel: Arc<AtomicBool>,
+        progress: &mut dyn FnMut(Phase, u64),
+    ) -> Result<Written, Error> {
         let mut target = Target::open(drive, policy)?;
-        let written = target.write_image(image, &mut |done| progress(Phase::Writing, done))?;
+        target.cancel_on(cancel);
+        let written = target.write_image(source, &mut |p| progress(Phase::Writing, p.written))?;
         target.verify(&written, &mut |done| progress(Phase::Verifying, done))?;
         Ok(written)
     }
@@ -103,10 +121,15 @@ pub fn serve<R: BufRead, W: Write>(input: R, output: W, options: Options) -> io:
 
 /// A write that passed every check, waiting for `confirm_write`.
 struct Pending {
-    image: PathBuf,
+    source: Source,
     drive: Drive,
+    /// The rules this write was checked against, used again for the write.
+    policy: Policy,
+    /// SHA-256 and length of what goes on the drive (decompressed).
     sha256: Sha256Digest,
     len: u64,
+    /// The file as it was when checked, to catch it changing before the write.
+    file_size: u64,
     modified: Option<SystemTime>,
     created: Instant,
 }
@@ -126,6 +149,7 @@ struct Job {
     image: PathBuf,
     total: u64,
     started: Instant,
+    cancel: Arc<AtomicBool>,
     shared: Arc<(Mutex<JobState>, Condvar)>,
     thread: Option<JoinHandle<()>>,
 }
@@ -281,7 +305,8 @@ impl<D: Drives> Server<D> {
                 " Writing ERASES a drive and takes two steps: prepare_write checks everything and returns a summary and a \
                  one-time token; show the summary to the person and get their explicit go-ahead before calling \
                  confirm_write with the token and the drive name. confirm_write starts the write in the background; call \
-                 write_status (with wait_seconds up to 30) until it reports done or failed, and tell the person the result.",
+                 write_status (with wait_seconds up to 30) until it reports done or failed, and tell the person the result. \
+                 cancel_write stops a write, leaving the drive unusable until it is written again.",
             );
         } else {
             text.push_str(" This server is read-only: the person has to restart it with --allow-writes before drives can be written.");
@@ -339,6 +364,7 @@ impl<D: Drives> Server<D> {
                         "drive": { "type": "string", "description": "Drive name as list_drives gives it, e.g. sdb" },
                         "sha256": { "type": "string", "description": "Expected SHA-256 of the image (64 hex digits)" },
                         "force": { "type": "boolean", "description": "Allow an image that won't boot when written raw" },
+                        "unmount": { "type": "boolean", "description": "Unmount the drive's volumes first instead of refusing (never the system's)" },
                     },
                     "required": ["image", "drive"],
                     "additionalProperties": false,
@@ -379,6 +405,19 @@ impl<D: Drives> Server<D> {
                 }),
                 read_only,
             ));
+            tools.push(tool(
+                "cancel_write",
+                "Stop a write",
+                "Stops a write started by confirm_write. The drive is then only partly written and won't boot until it \
+                 is written again. write_status reports when it has stopped.",
+                json!({
+                    "type": "object",
+                    "properties": { "job_id": { "type": "string", "description": "The job_id confirm_write returned" } },
+                    "required": ["job_id"],
+                    "additionalProperties": false,
+                }),
+                json!({ "readOnlyHint": false, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }),
+            ));
         }
         tools
     }
@@ -388,12 +427,13 @@ impl<D: Drives> Server<D> {
             "list_drives" => self.list_drives(),
             "inspect_image" => inspect_image(args),
             "hash_file" => hash_file(args, notifier),
-            "prepare_write" | "confirm_write" | "write_status" if !self.options.allow_writes => {
+            "prepare_write" | "confirm_write" | "write_status" | "cancel_write" if !self.options.allow_writes => {
                 Err("writing is turned off: the person has to restart this server with --allow-writes".into())
             }
             "prepare_write" => self.prepare_write(args, notifier),
             "confirm_write" => self.confirm_write(args),
             "write_status" => self.write_status(args, notifier),
+            "cancel_write" => self.cancel_write(args),
             other => return Err((-32602, format!("unknown tool {other}"))),
         };
         Ok(match outcome {
@@ -407,7 +447,7 @@ impl<D: Drives> Server<D> {
     }
 
     fn policy(&self) -> Policy {
-        Policy { allow_loop: self.options.allow_loop }
+        Policy { allow_loop: self.options.allow_loop, ..Policy::default() }
     }
 
     fn list_drives(&self) -> ToolResult {
@@ -436,7 +476,8 @@ impl<D: Drives> Server<D> {
         let image = PathBuf::from(arg(args, "image")?);
         let drive_name = arg(args, "drive")?;
         let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
-        let policy = self.policy();
+        let unmount = args.get("unmount").and_then(Value::as_bool).unwrap_or(false);
+        let policy = Policy { unmount, ..self.policy() };
 
         let info = image::inspect(&image).map_err(|e| format!("can't read {}: {e}", image.display()))?;
         let kind = info.kind();
@@ -451,20 +492,39 @@ impl<D: Drives> Server<D> {
         if let Some(job_id) = self.busy_job(&drive.name) {
             return Err(format!("{} is being written right now ({job_id}); wait for write_status to report the end", drive.name));
         }
-        drive.check(&policy).map_err(|reason| format!("{} can't be written: {reason}", drive.name))?;
-        write::fits(info.size, drive.size_bytes).map_err(|e| e.to_string())?;
+        drive
+            .check(&policy)
+            .map_err(|reason| format!("{} can't be written: {reason}", drive.name).replace("pass --unmount", "pass unmount: true"))?;
+        let source = info.source;
+        if let Some(bytes) = source.size {
+            write::fits(bytes, drive.size_bytes).map_err(|e| e.to_string())?;
+        }
+        let meta = fs::metadata(&image).map_err(|e| format!("can't read {}: {e}", image.display()))?;
 
-        let (sha256, len, modified) = hash_with_stamp(&image, notifier)?;
-        if let Some(expected) = args.get("sha256").and_then(Value::as_str) {
-            let expected = hash::parse_hex(expected).ok_or("sha256 must be 64 hex digits")?;
-            if expected != sha256 {
+        // The file's own hash, as publishers list it, when there's one to check against.
+        let expected = match args.get("sha256").and_then(Value::as_str) {
+            Some(hex) => Some((hash::parse_hex(hex).ok_or("sha256 must be 64 hex digits")?, "the sha256 given".to_string())),
+            None => checksums::find(&image).map(|p| (p.sha256, p.from.display().to_string())),
+        };
+        let plain = source.compression == Compression::None && !source.vhd;
+        let file_sha = if expected.is_some() || plain { Some(hash_with_stamp(&image, notifier)?.0) } else { None };
+        let mut checked = None;
+        if let (Some((want, from)), Some(got)) = (&expected, &file_sha) {
+            if want != got {
                 return Err(format!(
-                    "the image's SHA-256 is {}, not {}: the download is damaged or it's a different file. Nothing was written.",
-                    to_hex(&sha256),
-                    to_hex(&expected)
+                    "the image's SHA-256 is {}, but {from} says {}: the download is damaged or it's a different file. Nothing was written.",
+                    to_hex(got),
+                    to_hex(want)
                 ));
             }
+            checked = Some(from.clone());
         }
+        // What goes on the drive: the token is bound to exactly these bytes.
+        let (sha256, len) = match file_sha {
+            Some(digest) if plain => (digest, meta.len()),
+            _ => payload_digest(&source, notifier)?,
+        };
+        write::fits(len, drive.size_bytes).map_err(|e| e.to_string())?;
 
         let ttl = self.options.token_ttl;
         self.pending.retain(|_, p| p.created.elapsed() < ttl);
@@ -475,15 +535,28 @@ impl<D: Drives> Server<D> {
             let list: Vec<String> = drive.partitions.iter().map(|p| format!("{} {}", p.name, size(p.size_bytes))).collect();
             format!(", partitions {}", list.join(", "))
         };
+        let mounted: Vec<String> = drive
+            .usage
+            .iter()
+            .filter_map(|u| match &u.kind {
+                bc_core::UsageKind::Mounted(at) => Some(at.display().to_string()),
+                _ => None,
+            })
+            .collect();
+        let partitions =
+            if mounted.is_empty() { partitions } else { format!("{partitions}; it will unmount {} first", mounted.join(", ")) };
         let text = format!(
-            "Ready. This will ERASE everything on {} ({}, {}{partitions}) and write {} ({}, {}). Show this to the person and \
-             get their go-ahead, then call confirm_write with this token and drive \"{}\". The token works once, within {} seconds.",
+            "Ready. This will ERASE everything on {} ({}, {}{partitions}) and write {} ({}, {}, {} on the drive){}. Show this to \
+             the person and get their go-ahead, then call confirm_write with this token and drive \"{}\". The token works once, \
+             within {} seconds.",
             drive.path.display(),
             drive.label(),
             size(drive.size_bytes),
             image.display(),
+            source.describe(),
             kind.describe(),
             size(len),
+            checked.as_ref().map(|from| format!("; its SHA-256 matches {from}")).unwrap_or_default(),
             drive.name,
             ttl.as_secs(),
         );
@@ -491,9 +564,20 @@ impl<D: Drives> Server<D> {
             "token": token,
             "expires_in_seconds": ttl.as_secs(),
             "drive": drive_json(&drive, &policy),
-            "image": { "path": image, "size_bytes": len, "sha256": to_hex(&sha256), "kind": kind.describe() },
+            "image": {
+                "path": image,
+                "stored": source.describe(),
+                "file_size_bytes": meta.len(),
+                "file_sha256": file_sha.map(|d| to_hex(&d)),
+                "checksum_matches": checked,
+                "size_bytes": len,
+                "sha256": to_hex(&sha256),
+                "kind": kind.describe(),
+            },
         });
-        self.pending.insert(token, Pending { image, drive, sha256, len, modified, created: Instant::now() });
+        let pending =
+            Pending { source, drive, policy, sha256, len, file_size: meta.len(), modified: meta.modified().ok(), created: Instant::now() };
+        self.pending.insert(token, pending);
         Ok((text, data))
     }
 
@@ -515,24 +599,27 @@ impl<D: Drives> Server<D> {
         if let Some(job_id) = self.busy_job(&pending.drive.name) {
             return Err(format!("{} is being written right now ({job_id}); nothing new was started", pending.drive.name));
         }
-        let meta = fs::metadata(&pending.image).map_err(|e| format!("can't read {}: {e}", pending.image.display()))?;
-        if meta.len() != pending.len || meta.modified().ok() != pending.modified {
+        let image = pending.source.path.clone();
+        let meta = fs::metadata(&image).map_err(|e| format!("can't read {}: {e}", image.display()))?;
+        if meta.len() != pending.file_size || meta.modified().ok() != pending.modified {
             return Err("the image changed since prepare_write; nothing was written. Call prepare_write again.".into());
         }
 
         let job_id = self.new_id("job-");
         let shared = Arc::new((Mutex::new(JobState { phase: Phase::Writing, done: 0, outcome: None }), Condvar::new()));
+        let cancel = Arc::new(AtomicBool::new(false));
         let thread = {
-            let (drives, shared, policy) = (Arc::clone(&self.drives), Arc::clone(&shared), self.policy());
-            let Pending { drive, image, sha256, .. } = &pending;
-            let (drive, image, expected) = (drive.clone(), image.clone(), *sha256);
+            let (drives, shared, policy, cancel) = (Arc::clone(&self.drives), Arc::clone(&shared), pending.policy, Arc::clone(&cancel));
+            let (drive, source, expected) = (pending.drive.clone(), pending.source.clone(), pending.sha256);
             thread::spawn(move || {
                 let (state, changed) = &*shared;
                 let mut progress = |phase, done| {
                     let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
                     (state.phase, state.done) = (phase, done);
                 };
-                let outcome = match drives.write(&drive, &policy, &image, &mut progress) {
+                let result = drives.write(&drive, &policy, &source, cancel, &mut progress);
+                let phase = state.lock().unwrap_or_else(PoisonError::into_inner).phase;
+                let outcome = match result {
                     Ok(written) if written.sha256 != expected => Err(format!(
                         "the image changed while it was being written, so {} holds something other than what was \
                          prepared. Call prepare_write again.",
@@ -544,6 +631,13 @@ impl<D: Drives> Server<D> {
                         "verified": true,
                         "partition_table_reread": written.reread.is_ok(),
                     })),
+                    Err(Error::Cancelled) if phase == Phase::Verifying => {
+                        Err("stopped by cancel_write while verifying: the image was written in full, but not checked".into())
+                    }
+                    Err(Error::Cancelled) => Err(format!(
+                        "stopped by cancel_write: {} is only partly written and won't boot until it is written again",
+                        drive.name
+                    )),
                     Err(e) => Err(e.to_string()),
                 };
                 state.lock().unwrap_or_else(PoisonError::into_inner).outcome = Some(outcome);
@@ -554,9 +648,10 @@ impl<D: Drives> Server<D> {
             job_id.clone(),
             Job {
                 drive: pending.drive.name.clone(),
-                image: pending.image.clone(),
+                image: image.clone(),
                 total: pending.len,
                 started: Instant::now(),
+                cancel,
                 shared,
                 thread: Some(thread),
             },
@@ -565,7 +660,7 @@ impl<D: Drives> Server<D> {
             "Started erasing {} and writing {}. Call write_status with job_id \"{job_id}\" (wait_seconds up to {}) until it \
              reports done or failed.",
             pending.drive.name,
-            pending.image.display(),
+            image.display(),
             MAX_WAIT.as_secs()
         );
         Ok((text, json!({ "job_id": job_id, "drive": pending.drive.name, "status": "writing", "total_bytes": pending.len })))
@@ -640,6 +735,17 @@ impl<D: Drives> Server<D> {
         Ok((text, data))
     }
 
+    fn cancel_write(&mut self, args: &Value) -> ToolResult {
+        let job_id = arg(args, "job_id")?;
+        let job = self.jobs.get(job_id).ok_or_else(|| format!("no write job {job_id}"))?;
+        if !job.running() {
+            return Err(format!("{job_id} has already ended; write_status says how"));
+        }
+        job.cancel.store(true, Ordering::SeqCst);
+        let text = format!("Stopping the write to {}. Call write_status to see when it has stopped.", job.drive);
+        Ok((text, json!({ "job_id": job_id, "drive": job.drive, "status": "stopping" })))
+    }
+
     fn new_id(&mut self, prefix: &str) -> String {
         self.issued += 1;
         let mut hasher = RandomState::new().build_hasher();
@@ -676,16 +782,21 @@ fn inspect_image(args: &Value) -> ToolResult {
     let path = arg(args, "path")?;
     let info = image::inspect(Path::new(path)).map_err(|e| format!("can't read {path}: {e}"))?;
     let kind = info.kind();
-    let text = format!("{path} is {}. {}", kind.describe(), kind.advice());
+    let (source, header) = (&info.source, &info.header);
+    let text = format!("{path} is {} ({}). {}", kind.describe(), source.describe(), kind.advice());
     let data = json!({
         "path": path,
-        "size_bytes": info.size,
+        "stored": source.describe(),
+        "compression": source.compression.label(),
+        "file_size_bytes": source.file_size,
+        "size_bytes": source.size,
         "kind": kind.describe(),
         "boots_when_written_raw": kind.boots_when_written_raw(),
-        "iso_label": info.iso.as_ref().map(|i| i.volume_id.clone()),
-        "el_torito": info.iso.as_ref().is_some_and(|i| i.el_torito),
-        "mbr": info.mbr,
-        "gpt": info.gpt,
+        "iso_label": header.iso.as_ref().map(|i| i.volume_id.clone()),
+        "el_torito": header.iso.as_ref().is_some_and(|i| i.el_torito),
+        "mbr": header.mbr,
+        "gpt": header.gpt,
+        "checksum_file": checksums::find(Path::new(path)).map(|p| p.from),
         "advice": kind.advice(),
     });
     Ok((text, data))
@@ -695,6 +806,16 @@ fn hash_file(args: &Value, notifier: &mut Notifier<'_>) -> ToolResult {
     let path = arg(args, "path")?;
     let (digest, len, _) = hash_with_stamp(Path::new(path), notifier)?;
     Ok((format!("SHA-256 of {path}: {}", to_hex(&digest)), json!({ "path": path, "size_bytes": len, "sha256": to_hex(&digest) })))
+}
+
+/// SHA-256 and length of what `source` puts on the drive, decompressing it.
+fn payload_digest(source: &Source, notifier: &mut Notifier<'_>) -> Result<(Sha256Digest, u64), String> {
+    let fail = |e: io::Error| format!("can't read {}: {e}", source.path.display());
+    let mut stream = source.stream().map_err(fail)?;
+    let read = stream.file_bytes_read();
+    let message = format!("checking what {} holds", source.path.display());
+    hash::hash_to_end(&mut stream.reader, None, &mut |_| notifier.report(read.load(Ordering::Relaxed), source.file_size, &message))
+        .map_err(fail)
 }
 
 /// The file's SHA-256, its length, and when it was last modified.

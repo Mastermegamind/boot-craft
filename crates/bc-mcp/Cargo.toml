@@ -12,4 +12,5 @@ bc-core = { path = "../bc-core" }
 serde_json.workspace = true
 
 [dev-dependencies]
+flate2 = "1.1.11"
 tempfile.workspace = true

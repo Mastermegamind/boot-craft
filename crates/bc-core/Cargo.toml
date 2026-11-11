@@ -8,11 +8,21 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+bzip2 = "0.6.1"
+flate2 = "1.1.11"
+lzma-rs = "0.3.0"
+# 0.8 needs Rust 1.87 despite declaring 1.85
+ruzstd = "=0.7.3"
 sha2.workspace = true
 thiserror.workspace = true
+zip = { version = "7.3.0", default-features = false, features = ["deflate"] }
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 
+[target.'cfg(target_os = "macos")'.dependencies]
+plist = "1.8.0"
+
 [dev-dependencies]
+plist = "1.8.0"
 tempfile.workspace = true

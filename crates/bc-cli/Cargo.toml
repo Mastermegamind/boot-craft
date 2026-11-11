@@ -15,3 +15,4 @@ path = "src/main.rs"
 clap.workspace = true
 bc-core = { path = "../bc-core" }
 bc-mcp = { path = "../bc-mcp" }
+ctrlc = "3.5.2"
