@@ -36,6 +36,11 @@ echo "image: $iso"
 curl -sfL -o "$work/$iso" "$base/$iso"
 curl -sfL -o "$work/$iso.sha256" "$base/$iso.sha256"
 
+info=$("$BIN" info "$work/$iso")
+grep -q "^OS: *Linux" <<<"$info" || fail "not recognised as Linux: $info"
+grep -q "^Writes as: raw write" <<<"$info" || fail "not a raw write: $info"
+pass "recognised as $(grep '^Name:' <<<"$info" | sed 's/^Name: *//'), a hybrid ISO written raw"
+
 truncate -s 128M "$work/stick.bin"
 dev=$(losetup --find --show "$work/stick.bin")
 out=$("$BIN" write "$work/$iso" "$dev" --allow-loop --yes 2>&1) || fail "write failed: $out"

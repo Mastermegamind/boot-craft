@@ -12,7 +12,9 @@ what [Rufus](https://rufus.ie) does on Windows, sharing none of its code.
 
 ## Images
 
-The tool looks inside the image to work out what it is and how to write it.
+The tool looks inside the image (its files, partitions and boot firmware,
+never its file name) to work out which system it holds and how it has to be
+written. `boot-craft info` says what it found and why.
 
 | Image | Examples | Mode | Status |
 |---|---|---|---|
@@ -31,7 +33,7 @@ The tool looks inside the image to work out what it is and how to write it.
 |---|---|---|---|
 | List safe drives | done | done | done |
 | Raw write + verify | done | done | done |
-| Recognise every image type | planned (M2) | planned (M2) | planned (M2) |
+| Recognise every image type | done | done | done |
 | Windows install USB + Windows 11 options | planned (M3) | planned (M3) | planned (M3) |
 | Other ISOs, macOS media, FreeDOS | planned (M4) | planned (M4) | planned (M4) |
 | GUI | planned (M5) | planned (M5) | planned (M5) |
@@ -40,7 +42,8 @@ The tool looks inside the image to work out what it is and how to write it.
 
 ```sh
 boot-craft list                         # drives, and whether each may be written
-boot-craft info ubuntu.iso              # what the image is; will a raw write boot?
+boot-craft info ubuntu.iso              # which OS it holds, and how it has to be written
+boot-craft ls win11.iso sources         # the files inside an ISO (ISO 9660 or UDF)
 boot-craft hash ubuntu.iso              # SHA-256
 sudo boot-craft write ubuntu.iso sdb    # erase sdb and write the image, then verify
 sudo boot-craft write ubuntu.iso sdb --sha256 <expected>   # check the image first

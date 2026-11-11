@@ -130,18 +130,41 @@ Rules:
 
 ## M2: Recognise every image
 
-- [ ] Read ISO 9660 + Joliet directory trees; UDF in native Rust (needed on
-      Windows and macOS anyway, where `bsdtar`/7z can't be assumed)
-- [ ] Classify by content, not file name, into: Windows install, Windows PE,
-      Linux hybrid, Linux/other non-hybrid, macOS installer or recovery, BSD,
-      ChromeOS, ARM board image, unknown
-  - Windows: `sources/install.wim`/`.esd`, `bootmgr`, `efi/boot/bootx64.efi`
-  - Windows PE: `sources/boot.wim` without `install.wim`
-  - Linux: `casper/`, `live/`, `isolinux/`, `boot/grub/`, `LiveOS/`, `.disk/info`
-  - macOS: HFS+/APFS partitions, `BaseSystem.dmg`, `Install macOS*.app`
-  - BSD: FreeBSD/OpenBSD/NetBSD partition types and boot blocks
-- [ ] `info` reports the OS, version where found, and the mode that will be used
-- [ ] A small set of real-image fixtures (headers only, a few KiB each) per type
+- [x] File trees in pure Rust (`tree.rs`): ISO 9660 with Joliet and Rock Ridge
+      names, multi-extent files, and UDF (ECMA-167: anchor, partition and
+      logical volume descriptors, file entries, short/long/embedded
+      allocation), which Windows ISOs need: their ISO 9660 part may hold only
+      a README. Malformed input gives errors, never panics; sizes and depths
+      are capped
+- [x] Partition tables (`partitions.rs`): MBR and GPT (512- and 4096-byte
+      sectors), and the root of FAT partitions (to find the Raspberry Pi's
+      firmware)
+- [x] Classify by content, never file name (`detect.rs`):
+  - Windows install: `sources/install.wim`/`.esd`/`.swm`; release from
+    `sources/idwbinfo.txt` (build branch to "Windows 11 (24H2 or later)",
+    Windows Server by label), architecture
+  - Windows PE: `sources/boot.wim` without an install image
+  - FreeBSD (`bin/freebsd-version`, its version), OpenBSD
+    (`<version>/<arch>/bsd.rd`), NetBSD (`netbsd` kernel)
+  - Linux: `casper/`, `live/`, `LiveOS/`, `arch/`, `isolinux/`, `boot/grub/`...;
+    name from `.disk/info` or the label
+  - Disk images by partition type: ChromeOS, FreeBSD/OpenBSD/NetBSD, macOS
+    (HFS+/APFS), Raspberry Pi (firmware on the FAT boot partition), Linux
+  - `.dmg` (Apple UDIF, by its `koly` trailer): macOS, for the recovery mode
+  - Compressed images: recognised from their first 64 MiB, decompressed
+- [x] Each image gets a mode: raw write, Windows file copy (M3), file copy with
+      a boot loader (M4), macOS recovery (M4); `write` and `prepare_write`
+      refuse what they can't yet make bootable, saying why
+- [x] `info` reports the OS, name, version, architecture, file system, what
+      gave it away, and the mode; `boot-craft ls` and the MCP tool
+      `list_image_files` list the files inside an image
+- [x] Fixtures made with the tools real images are made with
+      (`tests/fixtures/make-fixtures.sh`: genisoimage with the UDF bridge,
+      sfdisk, sgdisk, mtools), 4-25 KiB each, gzipped
+- [x] The boot test checks the real Alpine ISO is recognised as Linux, raw
+- [ ] Windows: read the release name and editions from `install.wim`'s XML (M3)
+- [ ] Real-image checks for the big ones (Ubuntu, Fedora, Windows, FreeBSD...)
+      in the weekly job
 
 ## M3: Windows install USB (the main feature)
 - [ ] Partitioning in Rust: GPT and MBR (`gpt`, `mbrman` crates), same on all OSes

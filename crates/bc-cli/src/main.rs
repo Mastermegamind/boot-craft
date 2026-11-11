@@ -39,6 +39,16 @@ enum Command {
     Info { image: PathBuf },
     /// Print a file's SHA-256
     Hash { file: PathBuf },
+    /// List the files inside an ISO image
+    Ls {
+        image: PathBuf,
+        /// Only this directory and what's under it
+        #[arg(default_value = "")]
+        path: String,
+        /// List at most this many entries
+        #[arg(long, default_value_t = 1000)]
+        limit: usize,
+    },
     /// Erase a drive and write an image to it, then verify
     Write(WriteArgs),
     /// Serve AI agents over MCP on stdin/stdout (read-only unless --allow-writes)
@@ -132,6 +142,7 @@ fn run(cli: Cli) -> Result {
             println!("{}  {}", to_hex(&digest), file.display());
             Ok(())
         }
+        Command::Ls { image, path, limit } => list_files(&image, &path, limit),
         Command::Write(args) => write_image(&args),
         Command::Mcp { allow_writes, allow_loop } => {
             let options = bc_mcp::Options { allow_writes, allow_loop, ..bc_mcp::Options::default() };
@@ -182,6 +193,17 @@ fn info(path: &Path) -> Result {
         Some(bytes) => println!("Image:     {} ({bytes} bytes)", size(bytes)),
         None => println!("Image:     size known only once decompressed"),
     }
+    let found = &info.detected;
+    println!("OS:        {}", found.os);
+    if found.summary() != found.os.to_string() {
+        println!("Name:      {}", found.summary());
+    }
+    if let Some(format) = found.format {
+        println!("Files:     {}", format.label());
+    }
+    if !found.evidence.is_empty() {
+        println!("Found by:  {}", found.evidence.join("; "));
+    }
     println!("Kind:      {}", kind.describe());
     if let Some(iso) = &header.iso {
         println!("Label:     {}", iso.volume_id);
@@ -193,8 +215,34 @@ fn info(path: &Path) -> Result {
         Some(published) => println!("Checksum:  listed in {} (checked by `write`)", published.from.display()),
         None => println!("Checksum:  no SHA256SUMS or .sha256 file next to it"),
     }
+    println!("Writes as: {}", found.mode.describe());
     println!();
-    println!("{}", kind.advice());
+    if found.mode.supported() {
+        println!("It can be written with `boot-craft write`.");
+    } else {
+        println!("`boot-craft write` can't make this bootable yet; --force writes it raw, which won't boot.");
+    }
+    Ok(())
+}
+
+fn list_files(image: &Path, path: &str, limit: usize) -> Result {
+    let tree = bc_core::tree::Tree::open(File::open(image)?)?;
+    let mut tree = tree.ok_or("there's no ISO 9660 or UDF file system in it (compressed images must be decompressed first)")?;
+    let start = tree.find(path)?.ok_or_else(|| format!("no {path} in the image"))?;
+    let prefix = if path.trim_matches('/').is_empty() { String::new() } else { format!("{}/", path.trim_matches('/')) };
+    let entries = if start.is_dir { tree.walk_from(&start, limit)? } else { vec![(String::new(), start)] };
+    eprintln!("{} ({}):", image.display(), tree.format().label());
+    for (sub, entry) in &entries {
+        let shown = format!("{prefix}{sub}");
+        if entry.is_dir {
+            println!("{:>12}  {shown}/", "");
+        } else {
+            println!("{:>12}  {shown}", size(entry.size));
+        }
+    }
+    if entries.len() >= limit {
+        eprintln!("(stopped at {limit} entries; --limit lists more)");
+    }
     Ok(())
 }
 
@@ -204,9 +252,15 @@ fn write_image(args: &WriteArgs) -> Result {
 
     // Everything that can go wrong without touching the drive comes first.
     let info = image::inspect(&args.image)?;
-    let kind = info.kind();
-    if !kind.boots_when_written_raw() && !args.force {
-        return Err(format!("{} is {}.\n{}\nPass --force to write it anyway.", args.image.display(), kind.describe(), kind.advice()).into());
+    let mode = info.detected.mode;
+    if !mode.supported() && !args.force {
+        return Err(format!(
+            "{} is {}: it needs {}.\nWritten raw it won't boot; pass --force to write it raw anyway.",
+            args.image.display(),
+            info.detected.summary(),
+            mode.describe()
+        )
+        .into());
     }
     let expected = match &args.sha256 {
         Some(hex) => Some((hash::parse_hex(hex).ok_or("--sha256 takes 64 hex digits")?, "--sha256".to_string())),

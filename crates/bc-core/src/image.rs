@@ -8,9 +8,12 @@
 use std::io::{self, Cursor, Read, Seek, SeekFrom};
 use std::path::Path;
 
+use std::fs::File;
+
+use crate::detect::{self, Detected};
 use crate::error::Error;
 use crate::hash::read_some;
-use crate::source::Source;
+use crate::source::{Compression, Source};
 
 const ISO_SECTOR: u64 = 2048;
 /// ISO 9660 volume descriptors start at sector 16; real images have a handful.
@@ -51,6 +54,8 @@ pub enum ImageKind {
 pub struct ImageInfo {
     pub source: Source,
     pub header: Header,
+    /// The operating system inside, and how it has to be written.
+    pub detected: Detected,
 }
 
 impl ImageInfo {
@@ -102,7 +107,35 @@ pub fn inspect(path: &Path) -> Result<ImageInfo, Error> {
     let mut head = Vec::new();
     source.stream()?.reader.take(HEAD_LEN).read_to_end(&mut head)?;
     let header = inspect_reader(Cursor::new(head))?;
-    Ok(ImageInfo { source, header })
+    let detected = if source.compression == Compression::None {
+        if is_dmg(&source)? {
+            Detected::dmg()
+        } else {
+            // The payload starts at the file's first byte (a VHD's footer is at its end).
+            detect::detect(File::open(&source.path)?, &header)
+        }
+    } else {
+        // No random access into a compressed stream: look at its first part.
+        let mut prefix = Vec::new();
+        source.stream()?.reader.take(COMPRESSED_PREFIX).read_to_end(&mut prefix)?;
+        detect::detect(Cursor::new(prefix), &header)
+    };
+    Ok(ImageInfo { source, header, detected })
+}
+
+/// Of a compressed image, this much is decompressed to recognise it.
+const COMPRESSED_PREFIX: u64 = 64 << 20;
+
+/// An Apple UDIF disk image (`.dmg`), by the `koly` trailer in its last 512 bytes.
+fn is_dmg(source: &Source) -> io::Result<bool> {
+    if source.file_size < 1024 {
+        return Ok(false);
+    }
+    let mut file = File::open(&source.path)?;
+    file.seek(SeekFrom::Start(source.file_size - 512))?;
+    let mut magic = [0u8; 4];
+    file.read_exact(&mut magic)?;
+    Ok(&magic == b"koly")
 }
 
 pub fn inspect_reader<R: Read + Seek>(mut reader: R) -> io::Result<Header> {
@@ -234,5 +267,29 @@ mod tests {
         assert_eq!(info.kind(), ImageKind::HybridIso);
         assert_eq!(info.source.compression, crate::source::Compression::Gzip);
         assert_eq!(info.header.iso.unwrap().volume_id, "Ubuntu");
+    }
+
+    #[test]
+    fn inspect_recognises_the_os_in_plain_and_compressed_images() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = dir.path().join("windows.iso");
+        std::fs::write(&plain, crate::tree::tests::fixture("windows.iso.gz")).unwrap();
+        assert_eq!(inspect(&plain).unwrap().detected.os, crate::detect::Os::Windows);
+        // The fixture itself is gzipped: recognised through the decompressed prefix.
+        let packed = dir.path().join("freebsd.iso.gz");
+        std::fs::copy(format!("{}/tests/fixtures/freebsd.iso.gz", env!("CARGO_MANIFEST_DIR")), &packed).unwrap();
+        assert_eq!(inspect(&packed).unwrap().detected.os, crate::detect::Os::FreeBsd);
+    }
+
+    #[test]
+    fn dmg_files_are_macos_images_for_the_recovery_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("BaseSystem.dmg");
+        let mut bytes = vec![0u8; 8192];
+        let at = bytes.len() - 512;
+        bytes[at..at + 4].copy_from_slice(b"koly");
+        std::fs::write(&path, bytes).unwrap();
+        let found = inspect(&path).unwrap().detected;
+        assert_eq!((found.os, found.mode), (crate::detect::Os::MacOs, crate::detect::Mode::MacRecovery));
     }
 }

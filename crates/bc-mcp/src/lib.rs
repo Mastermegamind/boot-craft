@@ -343,6 +343,22 @@ impl<D: Drives> Server<D> {
                 read_only.clone(),
             ),
             tool(
+                "list_image_files",
+                "List the files in an image",
+                "The files and folders inside an ISO image (ISO 9660 or UDF), with sizes; under `path` if given.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Absolute path of the image file" },
+                        "dir": { "type": "string", "description": "A folder inside the image, e.g. sources" },
+                        "limit": { "type": "integer", "minimum": 1, "maximum": 5000, "description": "At most this many entries (default 500)" },
+                    },
+                    "required": ["path"],
+                    "additionalProperties": false,
+                }),
+                read_only.clone(),
+            ),
+            tool(
                 "hash_file",
                 "SHA-256 of a file",
                 "The SHA-256 of a file, to compare with the checksum its publisher gives.",
@@ -426,6 +442,7 @@ impl<D: Drives> Server<D> {
         let outcome = match name {
             "list_drives" => self.list_drives(),
             "inspect_image" => inspect_image(args),
+            "list_image_files" => list_image_files(args),
             "hash_file" => hash_file(args, notifier),
             "prepare_write" | "confirm_write" | "write_status" | "cancel_write" if !self.options.allow_writes => {
                 Err("writing is turned off: the person has to restart this server with --allow-writes".into())
@@ -481,8 +498,14 @@ impl<D: Drives> Server<D> {
 
         let info = image::inspect(&image).map_err(|e| format!("can't read {}: {e}", image.display()))?;
         let kind = info.kind();
-        if !kind.boots_when_written_raw() && !force {
-            return Err(format!("{} is {}. {} Pass force: true to write it anyway.", image.display(), kind.describe(), kind.advice()));
+        let mode = info.detected.mode;
+        if !mode.supported() && !force {
+            return Err(format!(
+                "{} is {}: it needs {}. Written raw it won't boot; pass force: true to write it raw anyway.",
+                image.display(),
+                info.detected.summary(),
+                mode.describe()
+            ));
         }
         let drive = self
             .drives
@@ -782,10 +805,25 @@ fn inspect_image(args: &Value) -> ToolResult {
     let path = arg(args, "path")?;
     let info = image::inspect(Path::new(path)).map_err(|e| format!("can't read {path}: {e}"))?;
     let kind = info.kind();
-    let (source, header) = (&info.source, &info.header);
-    let text = format!("{path} is {} ({}). {}", kind.describe(), source.describe(), kind.advice());
+    let (source, header, found) = (&info.source, &info.header, &info.detected);
+    let verdict = if found.mode.supported() { "It can be written with prepare_write." } else { "It can't be made bootable yet." };
+    let text = format!(
+        "{path} is {} ({}, {}); it needs {}. {verdict}",
+        found.summary(),
+        kind.describe(),
+        source.describe(),
+        found.mode.describe()
+    );
     let data = json!({
         "path": path,
+        "system": found.summary(),
+        "os": found.os.to_string(),
+        "version": found.version,
+        "arch": found.arch,
+        "file_system": found.format.map(|f| f.label()),
+        "found_by": found.evidence,
+        "mode": found.mode.describe(),
+        "writable_now": found.mode.supported(),
         "stored": source.describe(),
         "compression": source.compression.label(),
         "file_size_bytes": source.file_size,
@@ -800,6 +838,30 @@ fn inspect_image(args: &Value) -> ToolResult {
         "advice": kind.advice(),
     });
     Ok((text, data))
+}
+
+fn list_image_files(args: &Value) -> ToolResult {
+    let path = arg(args, "path")?;
+    let dir = args.get("dir").and_then(Value::as_str).unwrap_or("");
+    let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(500).clamp(1, 5000) as usize;
+    let file = File::open(path).map_err(|e| format!("can't read {path}: {e}"))?;
+    let mut tree = bc_core::tree::Tree::open(file)
+        .map_err(|e| format!("can't read {path}: {e}"))?
+        .ok_or("there's no ISO 9660 or UDF file system in it (compressed images must be decompressed first)")?;
+    let start = tree.find(dir).map_err(|e| e.to_string())?.ok_or_else(|| format!("no {dir} in the image"))?;
+    let entries = if start.is_dir { tree.walk_from(&start, limit).map_err(|e| e.to_string())? } else { vec![(String::new(), start)] };
+    let prefix = if dir.trim_matches('/').is_empty() { String::new() } else { format!("{}/", dir.trim_matches('/')) };
+    let files: Vec<Value> = entries
+        .iter()
+        .map(|(sub, e)| json!({ "path": format!("{prefix}{sub}"), "dir": e.is_dir, "size_bytes": (!e.is_dir).then_some(e.size) }))
+        .collect();
+    let text = format!(
+        "{} entries in {path} ({}){}",
+        files.len(),
+        tree.format().label(),
+        if files.len() >= limit { ", stopped at the limit" } else { "" }
+    );
+    Ok((text, json!({ "file_system": tree.format().label(), "truncated": files.len() >= limit, "files": files })))
 }
 
 fn hash_file(args: &Value, notifier: &mut Notifier<'_>) -> ToolResult {

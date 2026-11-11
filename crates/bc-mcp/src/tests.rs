@@ -224,7 +224,7 @@ fn notifications_get_no_reply_and_bad_messages_get_errors() {
 #[test]
 fn read_only_unless_writes_are_allowed() {
     let mut h = Harness::new(Options::default());
-    assert_eq!(tool_names(&mut h), ["list_drives", "inspect_image", "hash_file"]);
+    assert_eq!(tool_names(&mut h), ["list_drives", "inspect_image", "list_image_files", "hash_file"]);
     let image = h.image();
     for (tool, args) in [
         ("prepare_write", json!({ "image": image, "drive": "sdb" })),
@@ -240,7 +240,7 @@ fn read_only_unless_writes_are_allowed() {
     let mut h = Harness::writable();
     assert_eq!(
         tool_names(&mut h),
-        ["list_drives", "inspect_image", "hash_file", "prepare_write", "confirm_write", "write_status", "cancel_write"]
+        ["list_drives", "inspect_image", "list_image_files", "hash_file", "prepare_write", "confirm_write", "write_status", "cancel_write"]
     );
 }
 
@@ -460,7 +460,7 @@ fn serves_line_by_line_over_stdio() {
     let replies: Vec<Value> = String::from_utf8(output).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
     assert_eq!(replies.len(), 2, "the notification gets no reply");
     assert_eq!(replies[0]["id"], 1);
-    assert_eq!(replies[1]["result"]["tools"].as_array().unwrap().len(), 3);
+    assert_eq!(replies[1]["result"]["tools"].as_array().unwrap().len(), 4);
 }
 
 #[test]
@@ -526,4 +526,35 @@ fn a_mounted_stick_needs_unmount_and_the_summary_says_so() {
         h.request("tools/call", json!({ "name": "prepare_write", "arguments": { "image": image, "drive": "sdc", "unmount": true } }));
     let text = reply["result"]["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("it will unmount /media/STICK first"), "{text}");
+}
+
+fn windows_iso(h: &Harness) -> String {
+    let path = h._dir.path().join("windows.iso");
+    let mut iso = Vec::new();
+    let packed = fs::read(format!("{}/../bc-core/tests/fixtures/windows.iso.gz", env!("CARGO_MANIFEST_DIR"))).unwrap();
+    flate2::read::GzDecoder::new(packed.as_slice()).read_to_end(&mut iso).unwrap();
+    fs::write(&path, iso).unwrap();
+    path.display().to_string()
+}
+
+#[test]
+fn inspect_and_list_a_windows_iso() {
+    let mut h = Harness::new(Options::default());
+    let iso = windows_iso(&h);
+    let (_, data) = h.call("inspect_image", json!({ "path": iso }));
+    assert_eq!(data["os"], "Windows");
+    assert_eq!(data["system"], "Windows 11 (24H2 or later) (amd64)");
+    assert_eq!((data["file_system"].as_str(), data["writable_now"].as_bool()), (Some("UDF"), Some(false)));
+    let (is_error, data) = h.call("list_image_files", json!({ "path": iso, "dir": "sources" }));
+    assert!(!is_error, "{data}");
+    let paths: Vec<&str> = data["files"].as_array().unwrap().iter().map(|f| f["path"].as_str().unwrap()).collect();
+    assert_eq!(paths, ["sources/boot.wim", "sources/idwbinfo.txt", "sources/install.wim"]);
+}
+
+#[test]
+fn a_windows_iso_is_refused_until_the_file_copy_mode_exists() {
+    let mut h = Harness::writable();
+    let iso = windows_iso(&h);
+    let (is_error, text) = h.call("prepare_write", json!({ "image": iso, "drive": "sdb" }));
+    assert!(is_error && text.as_str().unwrap().contains("Windows file copy"), "{text}");
 }

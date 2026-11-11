@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 bzip2 = "0.6.1"
+fatfs = { version = "0.3.6", default-features = false, features = ["std", "alloc"] }
 flate2 = "1.1.11"
 lzma-rs = "0.3.0"
 # 0.8 needs Rust 1.87 despite declaring 1.85
@@ -24,5 +25,6 @@ libc.workspace = true
 plist = "1.8.0"
 
 [dev-dependencies]
+flate2 = "1.1.11"
 plist = "1.8.0"
 tempfile.workspace = true

@@ -8,12 +8,15 @@
 //! holds the only OS-specific code: listing drives and opening one raw.
 
 pub mod checksums;
+pub mod detect;
 pub mod drive;
 pub mod error;
 pub mod hash;
 pub mod image;
+pub mod partitions;
 pub mod platform;
 pub mod source;
+pub mod tree;
 pub mod write;
 
 pub use drive::{Drive, Partition, Policy, Refusal, Transport, Usage, UsageKind};
