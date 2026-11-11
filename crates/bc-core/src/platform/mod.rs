@@ -53,8 +53,8 @@ pub fn unmount(drive: &Drive) -> Result<(), Error> {
 /// anything else is using it. Callers check the drive first: see
 /// [`crate::write::Target::open`].
 pub fn open_exclusive(drive: &Drive) -> Result<RawDrive, Error> {
-    let Opened { file, sector, hold } = imp::open_exclusive(drive)?;
-    Ok(RawDrive { file, sector: sector.max(1), finished: false, scratch: Vec::new(), _hold: hold })
+    let Opened { file, sector, logical, hold } = imp::open_exclusive(drive)?;
+    Ok(RawDrive { file, sector: sector.max(1), logical: logical.max(512), finished: false, scratch: Vec::new(), _hold: hold })
 }
 
 /// What a backend hands back when it opens a drive.
@@ -63,6 +63,9 @@ pub struct Opened {
     /// Raw reads and writes must be whole multiples of this (1 where the OS
     /// buffers them, as Linux does).
     pub sector: usize,
+    /// The drive's logical sector size, which partition tables count in
+    /// (512 on nearly every USB stick, 4096 on a few).
+    pub logical: usize,
     /// Anything that has to stay alive while the drive is open, such as
     /// Windows volume locks.
     pub hold: Option<Box<dyn Send>>,
@@ -77,6 +80,7 @@ pub struct Opened {
 pub struct RawDrive {
     file: File,
     sector: usize,
+    logical: usize,
     /// A partial sector was read or written: it can only have been the last.
     finished: bool,
     scratch: Vec<u8>,
@@ -95,6 +99,11 @@ impl RawDrive {
     /// Asks the OS to read the partition table that was just written.
     pub fn reread_partitions(&self) -> io::Result<()> {
         imp::reread_partitions(&self.file)
+    }
+
+    /// The logical sector size partition tables count in.
+    pub fn logical_sector(&self) -> usize {
+        self.logical
     }
 
     fn whole_sectors(&self, len: usize) -> usize {
@@ -160,7 +169,7 @@ mod tests {
     /// disks on macOS and Windows do.
     fn drive(dir: &tempfile::TempDir) -> RawDrive {
         let file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(dir.path().join("d")).unwrap();
-        RawDrive { file, sector: 512, finished: false, scratch: Vec::new(), _hold: None }
+        RawDrive { file, sector: 512, logical: 512, finished: false, scratch: Vec::new(), _hold: None }
     }
 
     #[test]

@@ -121,6 +121,36 @@ impl<R: Read + Seek> Tree<R> {
         }
     }
 
+    /// `len` bytes of a file from `offset` (fewer at its end).
+    pub fn read_range(&mut self, file: &Entry, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+        let mut reader = self.reader(file);
+        reader.skip(offset);
+        let mut out = vec![0u8; len];
+        let mut filled = 0;
+        while filled < len {
+            let n = reader.read(&mut out[filled..])?;
+            if n == 0 {
+                break;
+            }
+            filled += n;
+        }
+        out.truncate(filled);
+        Ok(out)
+    }
+
+    /// A file's contents, streamed: for copying files of any size.
+    pub fn reader(&mut self, file: &Entry) -> FileReader<'_, R> {
+        let pieces = match &file.data {
+            Data::Extents(extents) => extents.clone(),
+            Data::Inline(_) => Vec::new(),
+        };
+        let inline = match &file.data {
+            Data::Inline(bytes) => bytes[..bytes.len().min(file.size as usize)].to_vec(),
+            Data::Extents(_) => Vec::new(),
+        };
+        FileReader { reader: &mut self.reader, pieces, inline, piece: 0, at: 0, left: file.size }
+    }
+
     /// The entry at `path` (`sources/install.wim`), compared case-insensitively
     /// as Windows and most ISO readers do.
     pub fn find(&mut self, path: &str) -> io::Result<Option<Entry>> {
@@ -178,6 +208,68 @@ impl<R: Read + Seek> Tree<R> {
             }
         }
         Ok(())
+    }
+}
+
+/// Reads one file inside an image; see [`Tree::reader`]. It ends early,
+/// rather than reading other files, if the image's records are short.
+pub struct FileReader<'a, R> {
+    reader: &'a mut R,
+    pieces: Vec<(u64, u64)>,
+    inline: Vec<u8>,
+    piece: usize,
+    /// Position inside the current piece (or the inline bytes).
+    at: u64,
+    left: u64,
+}
+
+impl<R> FileReader<'_, R> {
+    fn skip(&mut self, mut n: u64) {
+        n = n.min(self.left);
+        self.left -= n;
+        if self.pieces.is_empty() {
+            self.at += n;
+            return;
+        }
+        while n > 0 && self.piece < self.pieces.len() {
+            let here = self.pieces[self.piece].1 - self.at;
+            if n < here {
+                self.at += n;
+                return;
+            }
+            n -= here;
+            (self.piece, self.at) = (self.piece + 1, 0);
+        }
+    }
+}
+
+impl<R: Read + Seek> Read for FileReader<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.left == 0 || buf.is_empty() {
+            return Ok(0);
+        }
+        if self.pieces.is_empty() {
+            let start = (self.at as usize).min(self.inline.len());
+            let n = buf.len().min(self.inline.len() - start).min(self.left as usize);
+            buf[..n].copy_from_slice(&self.inline[start..start + n]);
+            self.at += n as u64;
+            self.left = if n == 0 { 0 } else { self.left - n as u64 };
+            return Ok(n);
+        }
+        while self.piece < self.pieces.len() && self.at >= self.pieces[self.piece].1 {
+            (self.piece, self.at) = (self.piece + 1, 0);
+        }
+        let Some(&(offset, len)) = self.pieces.get(self.piece) else { return Ok(0) };
+        let want = (buf.len() as u64).min(len - self.at).min(self.left) as usize;
+        self.reader.seek(SeekFrom::Start(offset + self.at))?;
+        let n = read_some(self.reader, &mut buf[..want])?;
+        if n == 0 {
+            self.left = 0; // the image is cut short
+        } else {
+            self.at += n as u64;
+            self.left -= n as u64;
+        }
+        Ok(n)
     }
 }
 
@@ -510,12 +602,33 @@ pub(crate) mod tests {
     fn windows_isos_are_read_through_udf() {
         let mut t = tree("windows.iso.gz");
         assert_eq!(t.format(), Format::Udf);
-        assert_eq!(names(&mut t, "sources"), ["boot.wim", "idwbinfo.txt", "install.wim"]);
+        assert_eq!(names(&mut t, "sources"), ["boot.wim", "idwbinfo.txt", "install.wim", "setup.dll"]);
         assert!(t.exists("EFI/BOOT/BOOTX64.EFI"), "found whatever the case");
         let info = t.text("sources/idwbinfo.txt", 4096).unwrap();
         assert!(info.contains("BuildBranch=ge_release"), "{info}");
         let wim = t.find("sources/install.wim").unwrap().unwrap();
-        assert_eq!((wim.is_dir, wim.size), (false, 8));
+        assert!(!wim.is_dir);
+        assert_eq!(t.read_range(&wim, 0, 8).unwrap(), b"MSWIM\0\0\0");
+    }
+
+    #[test]
+    fn files_stream_whole_and_from_any_offset() {
+        let expected: Vec<u8> = (0..3usize << 20).map(|i| (i * 7 % 251) as u8).collect();
+        let mut t = tree("windows.iso.gz");
+        let dll = t.find("sources/setup.dll").unwrap().unwrap();
+        assert_eq!(dll.size, expected.len() as u64);
+        let mut all = Vec::new();
+        t.reader(&dll).read_to_end(&mut all).unwrap();
+        assert!(all == expected, "streamed whole");
+        assert_eq!(t.read_range(&dll, 1_000_003, 5000).unwrap(), expected[1_000_003..1_005_003]);
+        assert_eq!(t.read_range(&dll, expected.len() as u64 - 3, 100).unwrap(), expected[expected.len() - 3..]);
+        assert!(t.read_range(&dll, 1 << 40, 10).unwrap().is_empty());
+        // Small UDF files live inside their entry.
+        let mut t = tree("windows.iso.gz");
+        let info = t.find("sources/idwbinfo.txt").unwrap().unwrap();
+        let mut text = String::new();
+        t.reader(&info).read_to_string(&mut text).unwrap();
+        assert!(text.starts_with("[BUILDINFO]"));
     }
 
     #[test]
@@ -534,7 +647,7 @@ pub(crate) mod tests {
         let (kind, root) = open_iso(&mut reader).unwrap().unwrap();
         let mut t = Tree { reader, kind, root };
         assert_eq!(t.format(), Format::Joliet);
-        assert_eq!(names(&mut t, "sources"), ["boot.wim", "idwbinfo.txt", "install.wim"]);
+        assert_eq!(names(&mut t, "sources"), ["boot.wim", "idwbinfo.txt", "install.wim", "setup.dll"]);
     }
 
     #[test]

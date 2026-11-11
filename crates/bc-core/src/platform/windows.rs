@@ -340,7 +340,7 @@ pub fn open_exclusive(drive: &Drive) -> Result<Opened, Error> {
         open(&path, GENERIC_READ | GENERIC_WRITE, FILE_FLAG_WRITE_THROUGH).map_err(|e| admin_or(e, || Error::Busy(drive.name.clone())))?;
     let sector =
         ioctl(&handle, IOCTL_DISK_GET_DRIVE_GEOMETRY_EX, &[], 256).ok().and_then(|g| u32_at(&g, 20)).filter(|&s| s > 0).unwrap_or(512);
-    Ok(Opened { file: File::from(handle), sector: sector as usize, hold: Some(Box::new(locks)) })
+    Ok(Opened { file: File::from(handle), sector: sector as usize, logical: sector as usize, hold: Some(Box::new(locks)) })
 }
 
 /// FlushFileBuffers, which on a disk handle also flushes the drive's cache.

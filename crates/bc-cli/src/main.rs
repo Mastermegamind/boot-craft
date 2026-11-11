@@ -10,9 +10,12 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use bc_core::detect::Mode;
 use bc_core::hash::{self, Sha256Digest, to_hex};
+use bc_core::layout::Scheme;
 use bc_core::write::{self, Target, WriteProgress};
 use bc_core::{Drive, Error, Policy, checksums, image, platform};
+use bc_core::{unattend, winusb};
 use clap::{Args, Parser, Subcommand};
 
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -86,6 +89,64 @@ struct WriteArgs {
     /// Don't ask for confirmation
     #[arg(long, short)]
     yes: bool,
+    #[command(flatten)]
+    windows: WindowsArgs,
+}
+
+/// How Windows install drives are made (Windows ISOs only).
+#[derive(Args, Default)]
+#[command(next_help_heading = "Windows install drives")]
+struct WindowsArgs {
+    /// Partition table: gpt (UEFI, the default) or mbr (UEFI on older firmware)
+    #[arg(long, value_enum, default_value_t = SchemeArg::Gpt)]
+    scheme: SchemeArg,
+    /// Windows 11: install without TPM 2.0, Secure Boot or 4 GB of RAM
+    #[arg(long)]
+    bypass_requirements: bool,
+    /// Make this local account instead of signing in to a Microsoft account (no internet needed)
+    #[arg(long, value_name = "NAME")]
+    local_account: Option<String>,
+    /// Answer the privacy questions with no
+    #[arg(long)]
+    skip_privacy: bool,
+    /// Language and region for setup and Windows, such as en-US or fr-FR
+    #[arg(long, value_name = "LOCALE")]
+    locale: Option<String>,
+    /// Don't let Windows turn on BitLocker device encryption by itself
+    #[arg(long)]
+    no_bitlocker: bool,
+    /// Where to split an install.wim over 4 GiB (needs that much free space)
+    #[arg(long, value_name = "DIR")]
+    temp_dir: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+enum SchemeArg {
+    #[default]
+    Gpt,
+    Mbr,
+}
+
+impl WindowsArgs {
+    fn options(&self) -> winusb::Options {
+        let unattend = unattend::Options {
+            bypass_requirements: self.bypass_requirements,
+            local_account: self.local_account.clone(),
+            skip_privacy: self.skip_privacy,
+            locale: self.locale.clone(),
+            no_bitlocker: self.no_bitlocker,
+        };
+        let scheme = match self.scheme {
+            SchemeArg::Gpt => Scheme::Gpt,
+            SchemeArg::Mbr => Scheme::Mbr,
+        };
+        winusb::Options { scheme, unattend, temp_dir: self.temp_dir.clone(), ..winusb::Options::default() }
+    }
+
+    /// Whether any option that only Windows images use was given.
+    fn any(&self) -> bool {
+        self.options().unattend.any() || self.scheme != SchemeArg::Gpt || self.temp_dir.is_some()
+    }
 }
 
 /// The user stopped the command (Ctrl-C); exits with 130 like an interrupted program.
@@ -215,7 +276,16 @@ fn info(path: &Path) -> Result {
         Some(published) => println!("Checksum:  listed in {} (checked by `write`)", published.from.display()),
         None => println!("Checksum:  no SHA256SUMS or .sha256 file next to it"),
     }
+    for (i, edition) in found.editions.iter().enumerate() {
+        println!("{}{edition}", if i == 0 { "Editions:  " } else { "           " });
+    }
     println!("Writes as: {}", found.mode.describe());
+    if found.mode == Mode::WindowsFiles {
+        match winusb::plan(&info.source, found, &winusb::Options::default()) {
+            Ok(plan) => println!("Plan:      {}", plan.describe()),
+            Err(e) => println!("Plan:      can't be made: {e}"),
+        }
+    }
     println!();
     if found.mode.supported() {
         println!("It can be written with `boot-craft write`.");
@@ -253,6 +323,11 @@ fn write_image(args: &WriteArgs) -> Result {
     // Everything that can go wrong without touching the drive comes first.
     let info = image::inspect(&args.image)?;
     let mode = info.detected.mode;
+    let windows = mode == Mode::WindowsFiles && !args.force;
+    if args.windows.any() && !windows {
+        return Err("--scheme, --temp-dir and the Windows setup options are for Windows install images only".into());
+    }
+    let plan = if windows { Some(winusb::plan(&info.source, &info.detected, &args.windows.options())?) } else { None };
     if !mode.supported() && !args.force {
         return Err(format!(
             "{} is {}: it needs {}.\nWritten raw it won't boot; pass --force to write it raw anyway.",
@@ -280,12 +355,33 @@ fn write_image(args: &WriteArgs) -> Result {
     }
     let drive = platform::find_drive(&args.drive)?.ok_or_else(|| format!("no drive named {}; see `boot-craft list`", args.drive))?;
     drive.check(&policy).map_err(|reason| format!("{} can't be written: {reason}", drive.name))?;
-    if let Some(bytes) = info.source.size {
+    if let Some(plan) = &plan {
+        plan.fits(drive.size_bytes)?;
+    } else if let Some(bytes) = info.source.size {
         write::fits(bytes, drive.size_bytes)?;
     }
-    confirm(&drive, &args.image, policy.unmount, args.yes)?;
+    let what = match &plan {
+        Some(plan) => {
+            let mut text = format!(
+                "makes a Windows install drive from {} ({}):
+  {}",
+                args.image.display(),
+                info.detected.summary(),
+                plan.describe()
+            );
+            for option in &plan.unattend_options {
+                text.push_str(&format!("\n  setup will {option}"));
+            }
+            text
+        }
+        None => format!("writes {} to it.", args.image.display()),
+    };
+    confirm(&drive, &what, policy.unmount, args.yes)?;
     if stop.load(Ordering::SeqCst) {
         return Err(Stopped("Stopped; nothing was written.".into()).into());
+    }
+    if let Some(plan) = &plan {
+        return write_windows(args, &info.source, plan, &drive, &policy, &stop);
     }
 
     let mut target = Target::open(&drive, &policy)?;
@@ -320,6 +416,84 @@ fn write_image(args: &WriteArgs) -> Result {
     Ok(())
 }
 
+/// Splits install.wim if need be (before anything is erased), then makes the stick.
+fn write_windows(
+    args: &WriteArgs,
+    source: &bc_core::source::Source,
+    plan: &winusb::Plan,
+    drive: &Drive,
+    policy: &Policy,
+    stop: &Arc<AtomicBool>,
+) -> Result {
+    let mut meters = Meters::default();
+    let prepared = winusb::prepare(source, plan, Some(stop), &mut |step, done, total| meters.update(step, done, total))
+        .map_err(|e| stopped_or(e, "Stopped; nothing was written."))?;
+    meters.done();
+
+    let mut target = Target::open(drive, policy)?;
+    target.cancel_on(Arc::clone(stop));
+    let written = target
+        .write_windows(source, plan, &prepared, !args.no_verify, &mut |step, done, total| meters.update(step, done, total))
+        .map_err(|e| {
+            if meters.step == Some(winusb::Step::Verifying) {
+                stopped_or(e, "Stopped while verifying: every file was written, but not all were checked.")
+            } else {
+                stopped_or(e, &format!("Stopped. {} is only partly written and won't boot; write it again or format it.", drive.name))
+            }
+        })?;
+    meters.done();
+    if let Err(e) = &written.reread {
+        eprintln!("note: the system didn't reread the new partition table ({e}); unplug and replug the drive to see it");
+    }
+    let count = written.built.files.len();
+    if written.verified {
+        eprintln!("Verified: all {count} files read back from the drive match ({}).", size(written.built.bytes));
+    } else {
+        eprintln!("Copied {count} files ({}); not read back (--no-verify).", size(written.built.bytes));
+    }
+    eprintln!("Done. {} can be removed. Boot from it in UEFI mode to install Windows.", drive.name);
+    Ok(())
+}
+
+/// One progress line per step of making a Windows stick.
+#[derive(Default)]
+struct Meters {
+    step: Option<winusb::Step>,
+    meter: Option<Meter>,
+    last: u64,
+}
+
+impl Meters {
+    fn update(&mut self, step: winusb::Step, done: u64, total: u64) {
+        if self.step != Some(step) {
+            self.done();
+            let label = match step {
+                winusb::Step::Extracting => "Extracting",
+                winusb::Step::Splitting => "Splitting install.wim for FAT32 (this takes a few minutes)...",
+                winusb::Step::Copying => "Copying  ",
+                winusb::Step::Verifying => "Verifying",
+            };
+            if step == winusb::Step::Splitting {
+                eprintln!("{label}");
+                self.meter = None;
+            } else {
+                self.meter = Some(Meter::new(label, Some(total)));
+            }
+            self.step = Some(step);
+        }
+        self.last = done;
+        if let Some(meter) = &mut self.meter {
+            meter.update(done, done as f64 / total.max(1) as f64);
+        }
+    }
+
+    fn done(&mut self) {
+        if let Some(mut meter) = self.meter.take() {
+            meter.finish(self.last);
+        }
+    }
+}
+
 /// `message` as a [`Stopped`] if `e` is a cancellation, else `e` itself.
 fn stopped_or(e: impl Into<Box<dyn std::error::Error>>, message: &str) -> Box<dyn std::error::Error> {
     let e = e.into();
@@ -330,7 +504,7 @@ fn stopped_or(e: impl Into<Box<dyn std::error::Error>>, message: &str) -> Box<dy
 }
 
 /// Says what will be erased and, unless `yes`, has the user type the drive's name.
-fn confirm(drive: &Drive, image: &Path, unmount: bool, yes: bool) -> Result {
+fn confirm(drive: &Drive, what: &str, unmount: bool, yes: bool) -> Result {
     eprintln!("This erases everything on {} ({}, {}):", drive.path.display(), drive.label(), size(drive.size_bytes));
     for partition in &drive.partitions {
         eprintln!("  {}  {}", partition.name, size(partition.size_bytes));
@@ -346,7 +520,7 @@ fn confirm(drive: &Drive, image: &Path, unmount: bool, yes: bool) -> Result {
             .collect();
         eprintln!("unmounting {} first,", mounted.join(", "));
     }
-    eprintln!("and writes {} to it.", image.display());
+    eprintln!("and {what}");
     if yes {
         return Ok(());
     }

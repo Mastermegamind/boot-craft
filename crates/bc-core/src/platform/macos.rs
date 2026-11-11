@@ -75,7 +75,7 @@ pub fn open_exclusive(drive: &Drive) -> Result<Opened, Error> {
     // SAFETY: the fd is open for the call and `block` is the u32 the ioctl writes.
     let result = unsafe { libc::ioctl(file.as_raw_fd(), DKIOCGETBLOCKSIZE, &mut block as *mut u32) };
     let sector = if result == 0 && block > 0 { block as usize } else { 512 };
-    Ok(Opened { file, sector, hold: None })
+    Ok(Opened { file, sector, logical: sector, hold: None })
 }
 
 /// `File::sync_all` uses `F_FULLFSYNC`, which raw disks refuse ("Inappropriate

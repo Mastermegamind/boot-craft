@@ -94,7 +94,7 @@ Rules:
       server finishes the write before exiting
 - [x] Cancel a write (`cancel_write`), leaving the drive marked as unusable
 - [ ] Later milestones add tools as features land: `list_image_files` (M2),
-      `make_windows_usb` with the Windows 11 options (M3), `make_macos_recovery` (M4)
+      `make_macos_recovery` (M4); Windows drives go through `prepare_write`
 - [x] Tests drive the server over in-memory stdio: handshake, tool listing with
       and without `--allow-writes`, refusals, token expiry and reuse
 
@@ -162,24 +162,53 @@ Rules:
       (`tests/fixtures/make-fixtures.sh`: genisoimage with the UDF bridge,
       sfdisk, sgdisk, mtools), 4-25 KiB each, gzipped
 - [x] The boot test checks the real Alpine ISO is recognised as Linux, raw
-- [ ] Windows: read the release name and editions from `install.wim`'s XML (M3)
+- [x] Windows: the release name ("Windows 11 24H2"), build and editions from
+      `install.wim`'s XML (`wim.rs`), read from its header without decompressing
 - [ ] Real-image checks for the big ones (Ubuntu, Fedora, Windows, FreeBSD...)
       in the weekly job
 
 ## M3: Windows install USB (the main feature)
-- [ ] Partitioning in Rust: GPT and MBR (`gpt`, `mbrman` crates), same on all OSes
-- [ ] **FAT32 mode**: format in Rust (`fatfs` crate), copy files, split
-      `install.wim` over 4 GiB into `.swm` (bundled `wimlib-imagex`)
+- [x] Partitioning in Rust (`layout.rs`): GPT with protective MBR and backup
+      table, or MBR with an active partition; 1 MiB aligned; old tables and
+      file system signatures at both ends cleared; 512- and 4096-byte sectors.
+      Written by our own code (tens of lines each) rather than the `gpt` /
+      `mbrman` crates
+- [x] Byte-level access to raw drives (`blockio.rs`): a write-back sector
+      cache, so file system code can write a few bytes while every write the
+      drive sees is whole, aligned sectors (macOS and Windows insist)
+- [x] **FAT32 mode** (`fat32.rs`, `winusb.rs`): our own FAT32 writer, as the
+      contents are known in advance: each file in one contiguous run, the FAT
+      written once, VFAT long names and Windows-style 8.3 names, data on a
+      1 MiB boundary. (`fatfs` 0.3's writer puts long-name entries before
+      `.`/`..` and points `..` at cluster 2; `fsck.fat` rejects that.
+      `fatfs` still reads the drive back for verification.) Every file is
+      hashed on the way and read back from the drive afterwards
+- [x] `install.wim` (or `.esd`) over 4 GiB split into `.swm` parts with
+      `wimlib-imagex` before anything is erased; found on the PATH or next to
+      boot-craft (bundled with releases in M6)
+- [x] Windows PE / rescue ISOs (Hiren's BootCD PE) through the same path
+- [x] Windows 11 setup options (`unattend.rs`): `autounattend.xml` to skip
+      the TPM / Secure Boot / RAM checks (LabConfig keys), make a local
+      account (BypassNRO), skip the privacy questions, set the locale, keep
+      BitLocker from encrypting by itself; a test pins the exact XML
+- [x] CLI (`--scheme`, the setup options, `--temp-dir`) and MCP
+      (`prepare_write` arguments; the split runs in the background job, before
+      the drive is touched)
+- [x] Tests: sticks built in memory from the fixture and read back file by
+      file; `fsck.fat` on our FAT32; a real wimlib split re-applied;
+      `scripts/windows-usb-test.sh` on loop devices: GPT and MBR, `fsck.fat`,
+      mounted by Linux, booted by OVMF in QEMU to its EFI loader, and (BIG=1)
+      a 4.1 GiB install.wim split and verified by wimlib
 - [ ] **NTFS mode**: NTFS data partition plus a small FAT partition with a
       UEFI:NTFS-style loader; NTFS formatting via the OS on Windows, bundled
-      `mkntfs` on Linux and macOS
-- [ ] Legacy BIOS boot: MBR boot code and NTFS/FAT boot sectors
-- [ ] Pick FAT32 or NTFS mode automatically and say why
-- [ ] Windows PE / rescue ISOs (Hiren's BootCD PE) through the same path
-- [ ] Windows 11 setup options: generate `autounattend.xml` to bypass the
-      TPM / Secure Boot / RAM checks (LabConfig keys), create a local account,
-      skip the privacy questions, set the region; a test for the exact XML
-      each option produces
+      `mkntfs` on Linux and macOS. Needed for ISOs with another file over
+      4 GiB, or an install.wim with one file inside over 4 GiB
+- [ ] Legacy BIOS boot: MBR boot code and a FAT32 boot sector that loads
+      `bootmgr`. Until then the boot sector says to start in UEFI mode
+- [ ] Pick FAT32 or NTFS mode automatically and say why (FAT32 only so far;
+      what it can't hold is refused before anything is erased)
+- [ ] A real Windows ISO through the weekly real-image job (Microsoft's
+      download links expire, so it needs a stored copy)
 
 ## M4: Other ISOs and operating systems
 

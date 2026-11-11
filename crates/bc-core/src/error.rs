@@ -28,6 +28,8 @@ pub enum Error {
     EmptyImage,
     #[error("the image got shorter while it was being written")]
     ImageChanged,
+    #[error("verification failed: {path} reads back from the drive as SHA-256 {actual}, but {expected} was written")]
+    FileMismatch { path: String, expected: String, actual: String },
     #[error("verification failed: the drive reads back as SHA-256 {actual}, the image is {expected}")]
     VerifyMismatch { expected: String, actual: String },
 }

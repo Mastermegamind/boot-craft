@@ -33,7 +33,26 @@ put windows boot/etfsboot.com
 put windows efi/boot/bootx64.efi
 put windows efi/microsoft/boot/efisys.bin
 put windows sources/boot.wim 'MSWIM\0\0\0'
-put windows sources/install.wim 'MSWIM\0\0\0'
+# A WIM header and the editions XML, laid out as in a real install.wim.
+python3 - "$work/windows/sources/install.wim" <<'PY'
+import struct, sys
+xml = ('<WIM><TOTALBYTES>1</TOTALBYTES>'
+       + ''.join(f'<IMAGE INDEX="{i}"><WINDOWS><ARCH>9</ARCH><EDITIONID>{eid}</EDITIONID>'
+                 '<INSTALLATIONTYPE>Client</INSTALLATIONTYPE><LANGUAGES><LANGUAGE>en-US</LANGUAGE></LANGUAGES>'
+                 '<VERSION><MAJOR>10</MAJOR><MINOR>0</MINOR><BUILD>26100</BUILD><SPBUILD>1742</SPBUILD></VERSION>'
+                 f'</WINDOWS><NAME>{name}</NAME><DISPLAYNAME>{name}</DISPLAYNAME></IMAGE>'
+                 for i, (eid, name) in enumerate([('Core', 'Windows 11 Home'), ('Professional', 'Windows 11 Pro')], 1))
+       + '</WIM>')
+data = b'\xff\xfe' + xml.encode('utf-16-le')
+head = bytearray(208)
+head[0:8] = b'MSWIM\0\0\0'
+struct.pack_into('<IHHI', head, 8, 208, 0, 0, 0)
+struct.pack_into('<HHI', head, 40, 1, 1, 2)
+struct.pack_into('<QQQ', head, 72, len(data) | (2 << 56), 208, len(data))
+open(sys.argv[1], 'wb').write(bytes(head) + data)
+PY
+# A file of several MiB, so copies span many clusters and chunks.
+python3 -c 'import sys; sys.stdout.buffer.write(bytes(i * 7 % 251 for i in range(3 << 20)))' > "$work/windows/sources/setup.dll"
 put windows sources/idwbinfo.txt '[BUILDINFO]\r\nBuildArch=amd64\r\nBuildBranch=ge_release\r\nBuildType=fre\r\n'
 iso windows CCCOMA_X64FRE_EN-US_DV9 -udf -J -iso-level 3
 

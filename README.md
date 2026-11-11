@@ -5,8 +5,9 @@ on **Windows, macOS and Linux**. Written from scratch in Rust; inspired by
 what [Rufus](https://rufus.ie) does on Windows, sharing none of its code.
 
 > **Status: early.** Raw writing with verification works on Linux, macOS
-> and Windows, for plain and compressed images; Windows-ISO support and the
-> other image types come next. See
+> and Windows, for plain and compressed images, and Windows 10/11 install
+> drives (UEFI, FAT32) can be made from Windows ISOs. NTFS and BIOS boot
+> for Windows, and the other image types, come next. See
 > [PLAN.md](PLAN.md) for the roadmap and [GOAL.md](GOAL.md) for what we're
 > building and why.
 
@@ -21,8 +22,8 @@ written. `boot-craft info` says what it found and why.
 | Linux hybrid ISOs | Ubuntu, Fedora, Debian, Mint, Arch, Kali, Parrot, Tails | raw write + verify | done |
 | BSD, ChromeOS Flex, ARM boards | FreeBSD memstick, ChromeOS Flex `.bin`, Raspberry Pi OS `.img` | raw write + verify | done |
 | Compressed images | `.xz`, `.gz`, `.zst`, `.bz2`, `.zip`, fixed `.vhd` | decompressed while writing | done |
-| Windows install ISOs | Windows 10 / 11, Server | file copy, FAT32 or NTFS, Windows 11 options | planned (M3) |
-| Windows PE ISOs | Hiren's BootCD PE | file copy | planned (M3) |
+| Windows install ISOs | Windows 10 / 11, Server | FAT32 file copy for UEFI, `install.wim` split if over 4 GiB, Windows 11 setup options | done (UEFI); NTFS and BIOS boot planned (M3) |
+| Windows PE ISOs | Hiren's BootCD PE | FAT32 file copy for UEFI | done |
 | Non-hybrid Linux / rescue ISOs | older distros | file copy + GRUB / Syslinux | planned (M4) |
 | macOS | recovery (`BaseSystem.dmg`) from any OS; full installer on a Mac | HFS+ / `createinstallmedia` | planned (M4) |
 | FreeDOS | built in | boot media | planned (M4) |
@@ -34,7 +35,8 @@ written. `boot-craft info` says what it found and why.
 | List safe drives | done | done | done |
 | Raw write + verify | done | done | done |
 | Recognise every image type | done | done | done |
-| Windows install USB + Windows 11 options | planned (M3) | planned (M3) | planned (M3) |
+| Windows install USB (UEFI) + Windows 11 options | done | done | done |
+| Windows: NTFS mode, BIOS boot | planned (M3) | planned (M3) | planned (M3) |
 | Other ISOs, macOS media, FreeDOS | planned (M4) | planned (M4) | planned (M4) |
 | GUI | planned (M5) | planned (M5) | planned (M5) |
 
@@ -49,6 +51,8 @@ sudo boot-craft write ubuntu.iso sdb    # erase sdb and write the image, then ve
 sudo boot-craft write ubuntu.iso sdb --sha256 <expected>   # check the image first
 sudo boot-craft write raspios.img.xz sdb --unmount          # compressed; unmount sdb's volumes first
 boot-craft list --watch                                     # follow drives as they come and go
+sudo boot-craft write Win11_24H2.iso sdb                    # a Windows install drive (UEFI)
+sudo boot-craft write Win11_24H2.iso sdb --bypass-requirements --local-account ada --skip-privacy
 ```
 
 Drive names follow each OS: `sdb` on Linux, `disk4` on macOS (run with
@@ -61,6 +65,37 @@ that for scripts). It reads the drive back afterwards and compares hashes
 `SHA256SUMS` (or `<image>.sha256`) file sits next to the image, the image is
 checked against it before anything is erased. Ctrl-C stops cleanly and says
 what state the drive is in.
+
+### Windows install drives
+
+A Windows ISO isn't written raw: its file system only works on DVDs.
+`write` makes the drive the way Microsoft's own tool does for UEFI PCs:
+a GPT partition table (`--scheme mbr` for older firmware), one FAT32
+partition, and the ISO's files, each read back and compared afterwards.
+`boot-craft info` shows the release and editions it found in `install.wim`.
+
+FAT32 can't hold files of 4 GiB or more, and current `install.wim`s are
+bigger. Such a WIM is split into `install.swm` parts, which Windows Setup
+reads as it is. Splitting uses wimlib's `wimlib-imagex` (Linux: the
+`wimtools` package; macOS: `brew install wimlib`; Windows: put
+`wimlib-imagex.exe` next to `boot-craft.exe`), and happens before anything
+is erased, in `/var/tmp` or the system temp folder (`--temp-dir` to choose;
+it needs the WIM's size free).
+
+Windows setup options go in an `autounattend.xml` on the drive, which Setup
+reads by itself. Each one only adds its own settings:
+
+| Option | What Setup does |
+|---|---|
+| `--bypass-requirements` | installs without TPM 2.0, Secure Boot or 4 GB of RAM (Windows 11's LabConfig keys) |
+| `--local-account NAME` | makes a local administrator account, no Microsoft account and no internet needed; it asks for a password at first sign-in |
+| `--skip-privacy` | answers the privacy questions with no |
+| `--locale en-US` | sets the language and region |
+| `--no-bitlocker` | doesn't turn on BitLocker device encryption by itself |
+
+These drives boot in UEFI mode, which every PC sold for Windows 8 or later
+has. Booting them from a legacy BIOS, and ISOs with a single file over
+4 GiB besides `install.wim` (which need NTFS), are not done yet.
 
 ## AI agents (MCP)
 
@@ -106,11 +141,14 @@ cargo build --release          # target/release/boot-craft
 cargo test                     # unit tests (no root, touches no drive)
 ```
 
-End-to-end test on a loop device (Linux, needs root, touches no real drive):
+End-to-end tests on loop devices (Linux, need root, touch no real drive):
 
 ```sh
 cargo build
-sudo scripts/loop-test.sh
+sudo scripts/loop-test.sh          # raw writes, compressed images, MCP
+sudo scripts/boot-test.sh          # the Alpine ISO, booted in QEMU (BIOS and UEFI)
+sudo scripts/windows-usb-test.sh   # Windows drives: fsck.fat, mount, UEFI boot in QEMU
+sudo BIG=1 scripts/windows-usb-test.sh   # also a 4 GiB+ install.wim, split
 ```
 
 ## Layout

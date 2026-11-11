@@ -8,6 +8,7 @@ use std::io::{Read, Seek};
 use crate::image::Header;
 use crate::partitions::{self, Table, guid};
 use crate::tree::{Format, Tree};
+use crate::wim;
 
 /// Text files read for names and versions are capped at this.
 const SMALL_FILE: usize = 64 << 10;
@@ -63,7 +64,9 @@ impl Mode {
     pub fn describe(self) -> &'static str {
         match self {
             Mode::Raw => "raw write: copied byte for byte, then verified",
-            Mode::WindowsFiles => "Windows file copy: partition, format, copy the files, add boot code (coming in M3)",
+            Mode::WindowsFiles => {
+                "Windows install drive: a FAT32 partition with the ISO's files, for UEFI (install.wim split if over 4 GiB)"
+            }
             Mode::BootloaderFiles => "file copy with a boot loader (GRUB / Syslinux) (coming in M4)",
             Mode::MacRecovery => "macOS recovery drive: GPT and HFS+ with the recovery image (coming in M4)",
             Mode::Unknown => "none known: a raw write is unlikely to boot",
@@ -72,7 +75,7 @@ impl Mode {
 
     /// Whether `boot-craft write` can do this today.
     pub fn supported(self) -> bool {
-        self == Mode::Raw
+        matches!(self, Mode::Raw | Mode::WindowsFiles)
     }
 }
 
@@ -89,11 +92,13 @@ pub struct Detected {
     pub format: Option<Format>,
     /// What gave it away: "sources/install.wim", "ChromeOS kernel partition"...
     pub evidence: Vec<String>,
+    /// Windows editions in the install image: "Windows 11 Pro"...
+    pub editions: Vec<String>,
 }
 
 impl Detected {
     fn new(os: Os, mode: Mode) -> Self {
-        Self { os, name: None, version: None, arch: None, mode, format: None, evidence: Vec::new() }
+        Self { os, name: None, version: None, arch: None, mode, format: None, evidence: Vec::new(), editions: Vec::new() }
     }
 
     /// An Apple disk image (`.dmg`): a recovery image, or an installer to convert.
@@ -159,6 +164,15 @@ fn from_files<R: Read + Seek>(tree: &mut Tree<R>, label: &str, raw_boots: bool) 
                 found.evidence.push(format!("sources/idwbinfo.txt: BuildBranch={branch}"));
             }
         }
+        if let Some(info) = wim_info(tree, install) {
+            if let Some(release) = info.release() {
+                found.name = Some(release);
+                found.version = info.build().or(found.version);
+                found.evidence.push(format!("{install}: editions XML"));
+            }
+            found.arch = info.arch().or(found.arch);
+            found.editions = info.editions.iter().map(ToString::to_string).collect();
+        }
         return found;
     }
     if tree.exists("sources/boot.wim") {
@@ -207,6 +221,15 @@ fn from_files<R: Read + Seek>(tree: &mut Tree<R>, label: &str, raw_boots: bool) 
         return found;
     }
     Detected::new(Os::Unknown, if raw_boots { Mode::Raw } else { Mode::Unknown })
+}
+
+/// The editions in a WIM inside the image, from its header and XML.
+fn wim_info<R: Read + Seek>(tree: &mut Tree<R>, path: &str) -> Option<wim::Info> {
+    let entry = tree.find(path).ok().flatten()?;
+    let head = tree.read_range(&entry, 0, wim::HEADER_LEN).ok()?;
+    let header = wim::header(&head)?;
+    let xml = tree.read_range(&entry, header.xml_offset, header.xml_len as usize).ok()?;
+    Some(wim::Info { editions: wim::editions(&xml), split: header.parts > 1 })
 }
 
 /// OpenBSD install media keep the release in a `<version>/<arch>/bsd.rd` path.
@@ -310,10 +333,13 @@ mod tests {
     fn windows_11_install_iso() {
         let d = detect_fixture("windows.iso.gz");
         assert_eq!((d.os, d.mode, d.format), (Os::Windows, Mode::WindowsFiles, Some(Format::Udf)));
-        assert_eq!(d.summary(), "Windows 11 (24H2 or later) (amd64)");
-        assert_eq!(d.version.as_deref(), Some("ge_release"));
+        // From install.wim's XML: the exact release, build and editions.
+        assert_eq!(d.summary(), "Windows 11 24H2 (amd64)");
+        assert_eq!(d.version.as_deref(), Some("10.0.26100.1742"));
+        assert_eq!(d.editions, ["Windows 11 Home (Core)", "Windows 11 Pro (Professional)"]);
         assert!(d.evidence.contains(&"sources/install.wim".to_string()));
-        assert!(!d.mode.supported(), "the Windows file copy comes in M3");
+        assert!(d.evidence.contains(&"sources/idwbinfo.txt: BuildBranch=ge_release".to_string()));
+        assert!(d.mode.supported());
     }
 
     #[test]

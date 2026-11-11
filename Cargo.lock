@@ -79,6 +79,7 @@ name = "bc-core"
 version = "0.1.0"
 dependencies = [
  "bzip2",
+ "crc32fast",
  "fatfs",
  "flate2",
  "libc",

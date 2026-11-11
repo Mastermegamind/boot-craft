@@ -32,11 +32,14 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
 
+use bc_core::detect::Mode;
 use bc_core::hash::{self, Sha256Digest, to_hex};
+use bc_core::layout::Scheme;
 use bc_core::source::{Compression, Source};
-use bc_core::write::{self, Target, Written};
+use bc_core::write::{self, Target, WindowsWritten, Written};
 use bc_core::{Drive, Error, Policy, platform};
 use bc_core::{checksums, image};
+use bc_core::{unattend, winusb};
 use serde_json::{Value, json};
 
 /// Newest first; a client asking for another gets the newest.
@@ -65,6 +68,8 @@ impl Default for Options {
 /// The stage a write is in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
+    /// Windows images: splitting install.wim, before the drive is touched.
+    Preparing,
     Writing,
     Verifying,
 }
@@ -84,6 +89,26 @@ pub trait Drives: Send + Sync + 'static {
         cancel: Arc<AtomicBool>,
         progress: &mut dyn FnMut(Phase, u64),
     ) -> Result<Written, Error>;
+    /// Splits install.wim if need be, then erases `drive` and makes a Windows
+    /// install drive from `source` as `plan` says, and verifies every file.
+    fn write_windows(
+        &self,
+        drive: &Drive,
+        policy: &Policy,
+        source: &Source,
+        plan: &winusb::Plan,
+        cancel: Arc<AtomicBool>,
+        progress: &mut dyn FnMut(Phase, u64),
+    ) -> Result<WindowsWritten, Error>;
+}
+
+/// Runs a Windows build's steps as phases.
+fn phase_of(step: winusb::Step) -> Phase {
+    match step {
+        winusb::Step::Extracting | winusb::Step::Splitting => Phase::Preparing,
+        winusb::Step::Copying => Phase::Writing,
+        winusb::Step::Verifying => Phase::Verifying,
+    }
 }
 
 pub struct SystemDrives;
@@ -111,6 +136,21 @@ impl Drives for SystemDrives {
         target.verify(&written, &mut |done| progress(Phase::Verifying, done))?;
         Ok(written)
     }
+
+    fn write_windows(
+        &self,
+        drive: &Drive,
+        policy: &Policy,
+        source: &Source,
+        plan: &winusb::Plan,
+        cancel: Arc<AtomicBool>,
+        progress: &mut dyn FnMut(Phase, u64),
+    ) -> Result<WindowsWritten, Error> {
+        let prepared = winusb::prepare(source, plan, Some(&cancel), &mut |step, done, _| progress(phase_of(step), done))?;
+        let mut target = Target::open(drive, policy)?;
+        target.cancel_on(cancel);
+        target.write_windows(source, plan, &prepared, true, &mut |step, done, _| progress(phase_of(step), done))
+    }
 }
 
 /// Serves the real drives on `input`/`output` until the input ends, then
@@ -122,6 +162,8 @@ pub fn serve<R: BufRead, W: Write>(input: R, output: W, options: Options) -> io:
 /// A write that passed every check, waiting for `confirm_write`.
 struct Pending {
     source: Source,
+    /// For a Windows install drive: what goes on it.
+    plan: Option<winusb::Plan>,
     drive: Drive,
     /// The rules this write was checked against, used again for the write.
     policy: Policy,
@@ -146,6 +188,7 @@ struct JobState {
 /// A write running (or finished) in the background.
 struct Job {
     drive: String,
+    windows: bool,
     image: PathBuf,
     total: u64,
     started: Instant,
@@ -370,8 +413,9 @@ impl<D: Drives> Server<D> {
             tools.push(tool(
                 "prepare_write",
                 "Prepare to write an image",
-                "Checks that `image` can be written to `drive` (the image boots raw, its SHA-256 matches if given, the drive \
-                 may be erased and is big enough) without changing anything. Returns what will be erased and a one-time \
+                "Checks that `image` can be written to `drive` (it can be made bootable, its SHA-256 matches if given, the \
+                 drive may be erased and is big enough) without changing anything. Hybrid ISOs and disk images are written \
+                 raw; Windows ISOs become a FAT32 install drive for UEFI, optionally with Windows 11 setup options. Returns what will be erased and a one-time \
                  token for confirm_write. Show the summary to the person before confirming.",
                 json!({
                     "type": "object",
@@ -381,6 +425,12 @@ impl<D: Drives> Server<D> {
                         "sha256": { "type": "string", "description": "Expected SHA-256 of the image (64 hex digits)" },
                         "force": { "type": "boolean", "description": "Allow an image that won't boot when written raw" },
                         "unmount": { "type": "boolean", "description": "Unmount the drive's volumes first instead of refusing (never the system's)" },
+                        "scheme": { "type": "string", "enum": ["gpt", "mbr"], "description": "Windows images: partition table (default gpt)" },
+                        "bypass_requirements": { "type": "boolean", "description": "Windows 11: install without TPM 2.0, Secure Boot or 4 GB of RAM" },
+                        "local_account": { "type": "string", "description": "Windows: create this local account instead of requiring a Microsoft account" },
+                        "skip_privacy": { "type": "boolean", "description": "Windows: answer the privacy questions with no" },
+                        "locale": { "type": "string", "description": "Windows: language and region, e.g. en-US" },
+                        "no_bitlocker": { "type": "boolean", "description": "Windows: don't turn on BitLocker device encryption automatically" },
                     },
                     "required": ["image", "drive"],
                     "additionalProperties": false,
@@ -499,6 +549,20 @@ impl<D: Drives> Server<D> {
         let info = image::inspect(&image).map_err(|e| format!("can't read {}: {e}", image.display()))?;
         let kind = info.kind();
         let mode = info.detected.mode;
+        let windows_options = windows_options(args)?;
+        let windows = mode == Mode::WindowsFiles && !force;
+        if windows_options.is_some() && !windows {
+            return Err("scheme and the Windows setup options are for Windows install images only".into());
+        }
+        let plan = if windows {
+            let options = windows_options.unwrap_or_default();
+            Some(
+                winusb::plan(&info.source, &info.detected, &options)
+                    .map_err(|e| format!("{} can't be made into a Windows drive: {e}", image.display()))?,
+            )
+        } else {
+            None
+        };
         if !mode.supported() && !force {
             return Err(format!(
                 "{} is {}: it needs {}. Written raw it won't boot; pass force: true to write it raw anyway.",
@@ -519,7 +583,9 @@ impl<D: Drives> Server<D> {
             .check(&policy)
             .map_err(|reason| format!("{} can't be written: {reason}", drive.name).replace("pass --unmount", "pass unmount: true"))?;
         let source = info.source;
-        if let Some(bytes) = source.size {
+        if let Some(plan) = &plan {
+            plan.fits(drive.size_bytes).map_err(|e| e.to_string())?;
+        } else if let Some(bytes) = source.size {
             write::fits(bytes, drive.size_bytes).map_err(|e| e.to_string())?;
         }
         let meta = fs::metadata(&image).map_err(|e| format!("can't read {}: {e}", image.display()))?;
@@ -543,11 +609,14 @@ impl<D: Drives> Server<D> {
             checked = Some(from.clone());
         }
         // What goes on the drive: the token is bound to exactly these bytes.
-        let (sha256, len) = match file_sha {
-            Some(digest) if plain => (digest, meta.len()),
+        let (sha256, len) = match (&plan, file_sha) {
+            (Some(plan), Some(digest)) => (digest, plan.bytes),
+            (None, Some(digest)) if plain => (digest, meta.len()),
             _ => payload_digest(&source, notifier)?,
         };
-        write::fits(len, drive.size_bytes).map_err(|e| e.to_string())?;
+        if plan.is_none() {
+            write::fits(len, drive.size_bytes).map_err(|e| e.to_string())?;
+        }
 
         let ttl = self.options.token_ttl;
         self.pending.retain(|_, p| p.created.elapsed() < ttl);
@@ -568,17 +637,23 @@ impl<D: Drives> Server<D> {
             .collect();
         let partitions =
             if mounted.is_empty() { partitions } else { format!("{partitions}; it will unmount {} first", mounted.join(", ")) };
+        let what = match &plan {
+            Some(plan) => {
+                let mut text =
+                    format!("make a Windows install drive from {} ({}): {}", image.display(), info.detected.summary(), plan.describe());
+                if !plan.unattend_options.is_empty() {
+                    text.push_str(&format!("; Windows setup will {}", plan.unattend_options.join(", ")));
+                }
+                text
+            }
+            None => format!("write {} ({}, {}, {} on the drive)", image.display(), source.describe(), kind.describe(), size(len)),
+        };
         let text = format!(
-            "Ready. This will ERASE everything on {} ({}, {}{partitions}) and write {} ({}, {}, {} on the drive){}. Show this to \
-             the person and get their go-ahead, then call confirm_write with this token and drive \"{}\". The token works once, \
-             within {} seconds.",
+            "Ready. This will ERASE everything on {} ({}, {}{partitions}) and {what}{}. Show this to the person and get their \
+             go-ahead, then call confirm_write with this token and drive \"{}\". The token works once, within {} seconds.",
             drive.path.display(),
             drive.label(),
             size(drive.size_bytes),
-            image.display(),
-            source.describe(),
-            kind.describe(),
-            size(len),
             checked.as_ref().map(|from| format!("; its SHA-256 matches {from}")).unwrap_or_default(),
             drive.name,
             ttl.as_secs(),
@@ -597,9 +672,25 @@ impl<D: Drives> Server<D> {
                 "sha256": to_hex(&sha256),
                 "kind": kind.describe(),
             },
+            "windows": plan.as_ref().map(|p| json!({
+                "plan": p.describe(),
+                "files": p.files,
+                "bytes": p.bytes,
+                "splits_install_wim": p.split.is_some(),
+                "setup_options": p.unattend_options,
+            })),
         });
-        let pending =
-            Pending { source, drive, policy, sha256, len, file_size: meta.len(), modified: meta.modified().ok(), created: Instant::now() };
+        let pending = Pending {
+            source,
+            plan,
+            drive,
+            policy,
+            sha256,
+            len,
+            file_size: meta.len(),
+            modified: meta.modified().ok(),
+            created: Instant::now(),
+        };
         self.pending.insert(token, pending);
         Ok((text, data))
     }
@@ -629,26 +720,40 @@ impl<D: Drives> Server<D> {
         }
 
         let job_id = self.new_id("job-");
-        let shared = Arc::new((Mutex::new(JobState { phase: Phase::Writing, done: 0, outcome: None }), Condvar::new()));
+        let first = if pending.plan.as_ref().is_some_and(|p| p.split.is_some()) { Phase::Preparing } else { Phase::Writing };
+        let shared = Arc::new((Mutex::new(JobState { phase: first, done: 0, outcome: None }), Condvar::new()));
         let cancel = Arc::new(AtomicBool::new(false));
         let thread = {
             let (drives, shared, policy, cancel) = (Arc::clone(&self.drives), Arc::clone(&shared), pending.policy, Arc::clone(&cancel));
-            let (drive, source, expected) = (pending.drive.clone(), pending.source.clone(), pending.sha256);
+            let (drive, source, expected, plan) = (pending.drive.clone(), pending.source.clone(), pending.sha256, pending.plan.clone());
             thread::spawn(move || {
                 let (state, changed) = &*shared;
                 let mut progress = |phase, done| {
                     let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
                     (state.phase, state.done) = (phase, done);
                 };
-                let result = drives.write(&drive, &policy, &source, cancel, &mut progress);
+                let result = match &plan {
+                    Some(plan) => drives.write_windows(&drive, &policy, &source, plan, cancel, &mut progress).map(Done::Windows),
+                    None => drives.write(&drive, &policy, &source, cancel, &mut progress).map(Done::Raw),
+                };
                 let phase = state.lock().unwrap_or_else(PoisonError::into_inner).phase;
                 let outcome = match result {
-                    Ok(written) if written.sha256 != expected => Err(format!(
+                    Ok(Done::Windows(made)) => Ok(json!({
+                        "files": made.built.files.len(),
+                        "bytes": made.built.bytes,
+                        "verified": made.verified,
+                        "partition_table_reread": made.reread.is_ok(),
+                    })),
+                    Err(Error::Cancelled) if phase == Phase::Preparing => {
+                        Err(format!("stopped by cancel_write while splitting install.wim: nothing was written to {}", drive.name))
+                    }
+                    Err(e) if phase == Phase::Preparing => Err(format!("{e}. Nothing was written to {}", drive.name)),
+                    Ok(Done::Raw(written)) if written.sha256 != expected => Err(format!(
                         "the image changed while it was being written, so {} holds something other than what was \
                          prepared. Call prepare_write again.",
                         drive.name
                     )),
-                    Ok(written) => Ok(json!({
+                    Ok(Done::Raw(written)) => Ok(json!({
                         "bytes": written.bytes,
                         "sha256": to_hex(&written.sha256),
                         "verified": true,
@@ -671,6 +776,7 @@ impl<D: Drives> Server<D> {
             job_id.clone(),
             Job {
                 drive: pending.drive.name.clone(),
+                windows: pending.plan.is_some(),
                 image: image.clone(),
                 total: pending.len,
                 started: Instant::now(),
@@ -696,6 +802,7 @@ impl<D: Drives> Server<D> {
         let deadline = Instant::now() + wait;
         // Progress over both phases, so it only ever goes up.
         let overall = |state: &JobState| match state.phase {
+            Phase::Preparing => 0,
             Phase::Writing => state.done,
             Phase::Verifying => job.total + state.done,
         };
@@ -739,6 +846,17 @@ impl<D: Drives> Server<D> {
                     size(rate)
                 )
             }
+            Some(Ok(result)) if job.windows => {
+                data["status"] = json!("done");
+                data["result"] = result.clone();
+                format!(
+                    "Done: {} is a Windows install drive made from {}: {} files, each read back and verified. It can be \
+                     removed; boot from it in UEFI mode.",
+                    job.drive,
+                    job.image.display(),
+                    result["files"]
+                )
+            }
             Some(Ok(result)) => {
                 data["status"] = json!("done");
                 data["result"] = result.clone();
@@ -777,6 +895,36 @@ impl<D: Drives> Server<D> {
     }
 }
 
+/// What a finished background write made.
+enum Done {
+    Raw(Written),
+    Windows(WindowsWritten),
+}
+
+/// The Windows drive options in `prepare_write`'s arguments, if any were given.
+fn windows_options(args: &Value) -> Result<Option<winusb::Options>, String> {
+    let flag = |name: &str| args.get(name).and_then(Value::as_bool).unwrap_or(false);
+    let text = |name: &str| args.get(name).and_then(Value::as_str).map(String::from);
+    let scheme = match args.get("scheme").and_then(Value::as_str) {
+        None => None,
+        Some("gpt") => Some(Scheme::Gpt),
+        Some("mbr") => Some(Scheme::Mbr),
+        Some(other) => return Err(format!("scheme is gpt or mbr, not {other}")),
+    };
+    let unattend = unattend::Options {
+        bypass_requirements: flag("bypass_requirements"),
+        local_account: text("local_account"),
+        skip_privacy: flag("skip_privacy"),
+        locale: text("locale"),
+        no_bitlocker: flag("no_bitlocker"),
+    };
+    if scheme.is_none() && !unattend.any() {
+        return Ok(None);
+    }
+    unattend.check()?;
+    Ok(Some(winusb::Options { scheme: scheme.unwrap_or(Scheme::Gpt), unattend, ..winusb::Options::default() }))
+}
+
 fn send<W: Write>(output: &mut W, message: &Value) -> io::Result<()> {
     serde_json::to_writer(&mut *output, message)?;
     output.write_all(b"\n")?;
@@ -785,6 +933,7 @@ fn send<W: Write>(output: &mut W, message: &Value) -> io::Result<()> {
 
 fn phase_name(phase: Phase) -> &'static str {
     match phase {
+        Phase::Preparing => "splitting install.wim",
         Phase::Writing => "writing",
         Phase::Verifying => "verifying",
     }
@@ -822,6 +971,7 @@ fn inspect_image(args: &Value) -> ToolResult {
         "arch": found.arch,
         "file_system": found.format.map(|f| f.label()),
         "found_by": found.evidence,
+        "windows_editions": found.editions,
         "mode": found.mode.describe(),
         "writable_now": found.mode.supported(),
         "stored": source.describe(),

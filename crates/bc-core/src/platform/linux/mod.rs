@@ -21,6 +21,8 @@ use crate::error::Error;
 const BLKRRPART: libc::c_ulong = 0x125f;
 /// `_IO(0x12, 97)`: flush the block device's buffer cache.
 const BLKFLSBUF: libc::c_ulong = 0x1261;
+/// The logical sector size (`BLKSSZGET`).
+const BLKSSZGET: libc::c_ulong = 0x1268;
 
 pub fn list_drives() -> io::Result<Vec<Drive>> {
     sysfs::list(&Roots::default())
@@ -66,8 +68,12 @@ pub fn open_exclusive(drive: &Drive) -> Result<Opened, Error> {
             Some(libc::EACCES | libc::EPERM) => Error::NeedsAdmin,
             _ => Error::Io(e),
         })?;
+    let mut logical: libc::c_int = 0;
+    // SAFETY: the fd is open for the call and `logical` is the int the ioctl writes.
+    let result = unsafe { libc::ioctl(file.as_raw_fd(), BLKSSZGET as _, &mut logical as *mut libc::c_int) };
+    let logical = if result == 0 && logical > 0 { logical as usize } else { 512 };
     // The page cache takes writes of any length.
-    Ok(Opened { file, sector: 1, hold: None })
+    Ok(Opened { file, sector: 1, logical, hold: None })
 }
 
 pub fn sync(file: &File) -> io::Result<()> {

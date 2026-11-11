@@ -79,6 +79,30 @@ impl Drives for FakeDrives {
         let sha256 = hash::hash_exact(&mut Cursor::new(&bytes), bytes.len() as u64, &mut |_| {})?;
         Ok(Written { bytes: bytes.len() as u64, sha256, reread: Ok(()) })
     }
+
+    /// The real thing, on a drive in memory.
+    fn write_windows(
+        &self,
+        drive: &Drive,
+        _policy: &Policy,
+        source: &Source,
+        plan: &winusb::Plan,
+        cancel: Arc<AtomicBool>,
+        progress: &mut dyn FnMut(Phase, u64),
+    ) -> Result<WindowsWritten, Error> {
+        self.writes.lock().unwrap().push((drive.name.clone(), source.path.clone()));
+        if self.fail {
+            return Err(Error::Io(io::Error::other("the stick was pulled out")));
+        }
+        let disk = 64u64 << 20;
+        let prepared = winusb::prepare(source, plan, Some(&cancel), &mut |_, _, _| progress(Phase::Preparing, 0))?;
+        let (built, dev) =
+            winusb::build(Cursor::new(vec![0u8; disk as usize]), disk, 512, source, plan, &prepared, Some(&cancel), &mut |_, done, _| {
+                progress(Phase::Writing, done)
+            })?;
+        winusb::verify(dev, disk, 512, &built, Some(&cancel), &mut |_, done, _| progress(Phase::Verifying, done))?;
+        Ok(WindowsWritten { built, verified: true, reread: Ok(()) })
+    }
 }
 
 struct Harness {
@@ -543,18 +567,44 @@ fn inspect_and_list_a_windows_iso() {
     let iso = windows_iso(&h);
     let (_, data) = h.call("inspect_image", json!({ "path": iso }));
     assert_eq!(data["os"], "Windows");
-    assert_eq!(data["system"], "Windows 11 (24H2 or later) (amd64)");
-    assert_eq!((data["file_system"].as_str(), data["writable_now"].as_bool()), (Some("UDF"), Some(false)));
+    assert_eq!(data["system"], "Windows 11 24H2 (amd64)");
+    assert_eq!(data["windows_editions"], json!(["Windows 11 Home (Core)", "Windows 11 Pro (Professional)"]));
+    assert_eq!((data["file_system"].as_str(), data["writable_now"].as_bool()), (Some("UDF"), Some(true)));
     let (is_error, data) = h.call("list_image_files", json!({ "path": iso, "dir": "sources" }));
     assert!(!is_error, "{data}");
     let paths: Vec<&str> = data["files"].as_array().unwrap().iter().map(|f| f["path"].as_str().unwrap()).collect();
-    assert_eq!(paths, ["sources/boot.wim", "sources/idwbinfo.txt", "sources/install.wim"]);
+    assert_eq!(paths, ["sources/boot.wim", "sources/idwbinfo.txt", "sources/install.wim", "sources/setup.dll"]);
 }
 
 #[test]
-fn a_windows_iso_is_refused_until_the_file_copy_mode_exists() {
+fn a_windows_iso_becomes_an_install_drive_in_two_steps() {
     let mut h = Harness::writable();
     let iso = windows_iso(&h);
-    let (is_error, text) = h.call("prepare_write", json!({ "image": iso, "drive": "sdb" }));
-    assert!(is_error && text.as_str().unwrap().contains("Windows file copy"), "{text}");
+    let args = json!({ "image": iso, "drive": "sdb", "scheme": "mbr", "bypass_requirements": true, "local_account": "ada" });
+    let (is_error, data) = h.call("prepare_write", args);
+    assert!(!is_error, "{data}");
+    assert_eq!(data["windows"]["plan"], "MBR partition table, one FAT32 partition \"CCCOMA_X64F\", 11 files");
+    assert_eq!(data["windows"]["setup_options"].as_array().unwrap().len(), 2);
+    let token = data["token"].as_str().unwrap().to_string();
+    let (is_error, data) = h.call("confirm_write", json!({ "token": token, "drive": "sdb" }));
+    assert!(!is_error, "{data}");
+    let job = data["job_id"].as_str().unwrap().to_string();
+    let status = h.status(&job, 30);
+    assert_eq!(status["status"], "done", "{status}");
+    assert_eq!((status["result"]["files"].as_u64(), status["result"]["verified"].as_bool()), (Some(11), Some(true)));
+    assert_eq!(h.server.drives.writes.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn windows_options_only_go_with_windows_images() {
+    let mut h = Harness::writable();
+    let disk = h.image.display().to_string();
+    let (is_error, text) = h.call("prepare_write", json!({ "image": disk, "drive": "sdb", "bypass_requirements": true }));
+    assert!(is_error && text.as_str().unwrap().contains("Windows install images only"), "{text}");
+    let iso = windows_iso(&h);
+    let (is_error, text) = h.call("prepare_write", json!({ "image": iso, "drive": "sdb", "scheme": "apm" }));
+    assert!(is_error && text.as_str().unwrap().contains("gpt or mbr"), "{text}");
+    let (is_error, text) = h.call("prepare_write", json!({ "image": iso, "drive": "sdb", "local_account": "Administrator" }));
+    assert!(is_error && text.as_str().unwrap().contains("Windows' own accounts"), "{text}");
+    assert!(h.server.drives.writes.lock().unwrap().is_empty());
 }

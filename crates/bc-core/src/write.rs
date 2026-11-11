@@ -14,6 +14,7 @@ use crate::error::Error;
 use crate::hash::{self, CHUNK, Sha256Digest, read_some, to_hex};
 use crate::platform::{self, RawDrive};
 use crate::source::Source;
+use crate::winusb;
 
 /// What a finished write did.
 #[derive(Debug)]
@@ -22,6 +23,15 @@ pub struct Written {
     pub sha256: Sha256Digest,
     /// Whether the OS reread the new partition table. Failing is harmless:
     /// the drive shows its new contents after a replug.
+    pub reread: Result<(), String>,
+}
+
+/// What a finished Windows stick holds.
+#[derive(Debug)]
+pub struct WindowsWritten {
+    pub built: winusb::Built,
+    pub verified: bool,
+    /// As for [`Written::reread`].
     pub reread: Result<(), String>,
 }
 
@@ -94,6 +104,30 @@ impl Target {
         self.raw.flush_to_drive()?;
         let reread = self.raw.reread_partitions().map_err(|e| e.to_string());
         Ok(Written { bytes, sha256, reread })
+    }
+
+    /// Erases the drive and makes a Windows install stick on it from the ISO
+    /// in `source`, as `plan` says (see [`winusb`]). `prepared` holds the split
+    /// `install.wim`, if it needed splitting. With `verify`, every file is
+    /// read back from the drive afterwards.
+    pub fn write_windows(
+        &mut self,
+        source: &Source,
+        plan: &winusb::Plan,
+        prepared: &winusb::Prepared,
+        verify: bool,
+        progress: &mut dyn FnMut(winusb::Step, u64, u64),
+    ) -> Result<WindowsWritten, Error> {
+        let (size, sector) = (self.drive.size_bytes, self.raw.logical_sector());
+        let cancel = self.cancel.as_deref();
+        self.raw.seek(SeekFrom::Start(0))?;
+        let (built, _) = winusb::build(&mut self.raw, size, sector, source, plan, prepared, cancel, progress)?;
+        self.raw.flush_to_drive()?;
+        if verify {
+            winusb::verify(&mut self.raw, size, sector, &built, cancel, progress)?;
+        }
+        let reread = self.raw.reread_partitions().map_err(|e| e.to_string());
+        Ok(WindowsWritten { built, verified: verify, reread })
     }
 
     /// Reads back what was written and compares hashes.

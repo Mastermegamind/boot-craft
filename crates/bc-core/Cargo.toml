@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 bzip2 = "0.6.1"
+crc32fast = "1.5"
 fatfs = { version = "0.3.6", default-features = false, features = ["std", "alloc"] }
 flate2 = "1.1.11"
 lzma-rs = "0.3.0"

@@ -112,3 +112,18 @@ jobs:
       - run: cargo build --locked
       - run: sudo scripts/boot-test.sh
 
+
+  windows-usb:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.85"
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y genisoimage wimtools grub-efi-amd64-bin dosfstools qemu-system-x86 ovmf
+      # The unit tests that need wimlib, genisoimage and fsck.fat, now that they're installed.
+      - run: PATH=$PATH:/usr/sbin cargo test --locked -p bc-core -- winusb fat32
+      - run: cargo build --locked
+      # The runner's /mnt has room for the 4 GiB+ install.wim test.
+      - run: sudo mkdir -p /mnt/work && sudo env BIG=1 WORK_ROOT=/mnt/work scripts/windows-usb-test.sh

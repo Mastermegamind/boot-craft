@@ -90,7 +90,7 @@ pub fn is_cancelled(e: &io::Error) -> bool {
 }
 
 /// One `read`, retried when a signal interrupts it.
-pub(crate) fn read_some<R: Read>(reader: &mut R, buf: &mut [u8]) -> io::Result<usize> {
+pub(crate) fn read_some<R: Read + ?Sized>(reader: &mut R, buf: &mut [u8]) -> io::Result<usize> {
     loop {
         match reader.read(buf) {
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
