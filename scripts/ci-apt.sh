@@ -1,15 +1,14 @@
 #!/usr/bin/env bash
-# Installs packages on a CI runner: apt can hang on a slow mirror, so each
-# try gets five minutes, three tries in all.
+# Installs packages on a CI runner. The runner's package lists usually do,
+# so no `apt-get update` first (it has hung for most of an hour on runners);
+# only if the install fails, update and try again, with a time limit.
 #   scripts/ci-apt.sh package...
 set -uo pipefail
-export DEBIAN_FRONTEND=noninteractive
+apt() { sudo env DEBIAN_FRONTEND=noninteractive timeout 300 apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 "$@"; }
+apt install -y "$@" && exit 0
 for try in 1 2 3; do
-    if sudo -E timeout 300 apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update -qq &&
-        sudo -E timeout 300 apt-get -o Acquire::Retries=3 install -y -qq "$@"; then
-        exit 0
-    fi
-    echo "apt try $try failed or timed out; trying again" >&2
+    echo "install failed; updating the package lists (try $try)" >&2
+    apt update && apt install -y "$@" && exit 0
     sleep 10
 done
 exit 1
