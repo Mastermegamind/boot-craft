@@ -69,6 +69,14 @@ put ubuntu boot/grub/grub.cfg
 put ubuntu EFI/boot/bootx64.efi
 iso ubuntu 'Ubuntu 26.04 LTS amd64' -R -J
 
+# GParted Live: Debian Live underneath (.disk/info says Debian Sid), its
+# own name in GParted-Live-Version.
+put gparted .disk/info 'Debian GNU/Linux none "Sid" - Snapshot amd64 LIVE Binary 20260404-21:11'
+put gparted GParted-Live-Version 'gparted-live-1.8.1-3-amd64\n'
+put gparted live/vmlinuz
+put gparted EFI/boot/bootx64.efi
+iso gparted 'GParted-live' -R -J
+
 # Fedora: Rock Ridge only; the label names the release.
 put fedora LiveOS/squashfs.img
 put fedora boot/x86_64/loader/linux

@@ -222,6 +222,15 @@ Rules:
       QEMU/OVMF boots it through the real UEFI:NTFS; on Windows, chkdsk finds
       no problems and Windows reads every file
 - [x] Pick FAT32 or NTFS automatically and say why (`--filesystem` to choose)
+- [x] A real Windows ISO, by hand (2026-11-12): `Win11_25H2_English_x64_v2.iso`
+      (7.9 GiB, 11 editions) made into an MBR FAT32 stick on a loop device:
+      install.wim split into 3 parts, fsck.fat clean, wimlib verifies the
+      parts. In QEMU, SeaBIOS starts Microsoft's real bootmgr (473 KB)
+      through our boot code to Windows Setup, and so does OVMF (UEFI); Setup
+      lists the editions from install.swm; with `--bypass-requirements` it
+      installs on a VM with no TPM, applying the whole split image, up to
+      the first restart. Not yet checked: first sign-in (local account,
+      privacy questions), which needs booting the installed disk
 - [ ] A real Windows ISO through the weekly real-image job (Microsoft's
       download links expire, so it needs a stored copy)
 

@@ -203,6 +203,22 @@ fn from_files<R: Read + Seek>(tree: &mut Tree<R>, label: &str, raw_boots: bool) 
     let markers = ["casper", "live", "LiveOS", "arch", "boot/x86_64/loader", "images/pxeboot", "isolinux", "syslinux", "boot/grub"];
     if let Some(marker) = markers.into_iter().find(|m| tree.exists(m)) {
         let mut found = Detected::new(Os::Linux, unix_mode).because(marker);
+        // Tools built on Debian Live (GParted, Clonezilla) name themselves in
+        // a version file, "gparted-live-1.8.1-3-amd64"; their .disk/info says Debian.
+        for (file, name) in [("GParted-Live-Version", "GParted Live"), ("Clonezilla-Live-Version", "Clonezilla Live")] {
+            let Some(text) = tree.text(file, SMALL_FILE) else { continue };
+            let line = text.lines().next().unwrap_or("").trim();
+            let rest = line.split_once("-live-").map_or(line, |(_, r)| r);
+            let (version, arch) = match rest.rsplit_once('-') {
+                Some((v, a)) if ["amd64", "i686", "i686-pae", "arm64"].contains(&a) => (v, Some(a)),
+                _ => (rest, None),
+            };
+            found.name = Some(format!("{name} {version}").trim().to_string());
+            found.version = Some(version.to_string()).filter(|v| !v.is_empty());
+            found.arch = arch.map(String::from);
+            found.evidence.push(file.into());
+            return found;
+        }
         // Ubuntu, Debian, Mint and friends name the release in .disk/info.
         if let Some(info) = tree.text(".disk/info", SMALL_FILE) {
             let line = info.lines().next().unwrap_or("").trim();
@@ -356,6 +372,14 @@ mod tests {
         assert_eq!(d.summary(), "Ubuntu 26.04 LTS \"Resolute Raccoon\" (amd64)");
         // The fixture isn't hybrid; a real Ubuntu ISO is, and then the mode is Raw.
         assert_eq!(d.mode, Mode::BootloaderFiles);
+    }
+
+    #[test]
+    fn gparted_is_named_from_its_version_file() {
+        let d = detect_fixture("gparted.iso.gz");
+        assert_eq!(d.os, Os::Linux);
+        assert_eq!(d.summary(), "GParted Live 1.8.1-3 (amd64)");
+        assert_eq!(d.version.as_deref(), Some("1.8.1-3"));
     }
 
     #[test]
